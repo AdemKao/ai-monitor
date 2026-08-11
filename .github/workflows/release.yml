@@ -1,0 +1,225 @@
+# This workflow follows the dist (formerly cargo-dist) GitHub release flow.
+# It intentionally publishes only GitHub Release artifacts; Homebrew and npm
+# publisher jobs are not enabled and therefore require no extra secrets.
+
+name: Release
+
+on:
+  pull_request:
+  push:
+    tags:
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
+      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      publishing: ${{ !github.event.pull_request }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install dist
+        shell: bash
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+      - name: Cache dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-cache
+          path: ~/.cargo/bin/dist
+      - id: plan
+        name: Plan release
+        shell: bash
+        run: |
+          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          echo "manifest=$(jq -c '.' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Upload plan manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-plan-manifest
+          path: plan-dist-manifest.json
+
+  build-local-artifacts:
+    name: build (${{ join(matrix.targets, ', ') }})
+    needs: plan
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container && matrix.container.image || null }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    permissions:
+      contents: read
+    steps:
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install Rust in build containers
+        if: ${{ matrix.container }}
+        shell: bash
+        run: |
+          if ! command -v cargo > /dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Install dist
+        run: ${{ matrix.install_dist.run }}
+      - name: Fetch plan manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-plan-manifest
+          path: target/distrib/
+      - name: Install build dependencies
+        run: ${{ matrix.packages_install }}
+      - name: Build local artifacts
+        shell: bash
+        run: dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+      - id: dist
+        name: Collect local artifacts
+        shell: bash
+        run: |
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output '.upload_files[]' dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Upload local artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-build-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  build-global-artifacts:
+    name: build global artifacts
+    needs:
+      - plan
+      - build-local-artifacts
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Fetch cached dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-cache
+          path: ~/.cargo/bin/
+      - name: Make dist executable
+        run: chmod +x ~/.cargo/bin/dist
+      - name: Fetch plan manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-plan-manifest
+          path: target/distrib/
+      - name: Fetch local artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-build-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: dist
+        name: Build global artifacts
+        shell: bash
+        run: |
+          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json --artifacts=global > dist-manifest.json
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output '.upload_files[]' dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Upload global artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-build-global
+          path: |
+            ${{ steps.dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  host:
+    name: publish GitHub Release
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Fetch cached dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-cache
+          path: ~/.cargo/bin/
+      - name: Make dist executable
+        run: chmod +x ~/.cargo/bin/dist
+      - name: Fetch plan manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-plan-manifest
+          path: target/distrib/
+      - name: Fetch built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-build-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: host
+        name: Prepare release metadata
+        shell: bash
+        run: |
+          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          echo "manifest=$(jq -c '.' dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Fetch release files
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-build-*
+          path: artifacts/
+          merge-multiple: true
+      - name: Remove internal manifests
+        shell: bash
+        run: rm -f artifacts/*-dist-manifest.json artifacts/plan-dist-manifest.json
+      - name: Create GitHub Release
+        env:
+          PRERELEASE_FLAG: ${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}
+          ANNOUNCEMENT_TITLE: ${{ fromJson(steps.host.outputs.manifest).announcement_title }}
+          ANNOUNCEMENT_BODY: ${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          printf '%s\n' "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
+          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*

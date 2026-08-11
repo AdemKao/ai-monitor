@@ -1,0 +1,23 @@
+[workspace]
+members = ["cargo:."]
+
+# Configuration for dist (formerly cargo-dist).
+[dist]
+# Pin the release tool used by CI for reproducible release planning.
+cargo-dist-version = "0.32.0"
+ci = "github"
+
+# release.yml is intentionally kept small and does not enable package
+# publishers that would require additional repository secrets.
+allow-dirty = ["ci"]
+hosting = ["github"]
+installers = ["shell", "powershell"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+checksum = "sha256"
+install-path = "CARGO_HOME"
+pr-run-mode = "plan"
