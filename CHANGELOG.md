@@ -2,6 +2,11 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.4.1] - 2026-08-11
+
+- 新增 `PRIMARY -> SUBAGENT RELATIONSHIPS`，顯示 spawns、calls、tokens 與 share。
+- 使用 `session.parent_id` 建立關係，避免高成本的 `message.parentID` join。
+
 ## [0.4.0] - 2026-08-11
 
 - 新增 `opencode dashboard`，依 project、agent／subagent 顯示 calls、sessions、tokens 與 share。
@@ -63,3 +68,4 @@
 [0.3.4]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.4
 [0.3.5]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.5
 [0.4.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.4.0
+[0.4.1]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.4.1

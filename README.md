@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.4.0`  
+目前版本：`v0.4.1`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
@@ -198,7 +198,7 @@ ai-monitor opencode dashboard --all-projects --days 30
 ai-monitor opencode dashboard --project "$PWD" --top-agents 0
 ```
 
-dashboard 預設顯示目前 project 最近 7 天的 calls、sessions、active tokens 與 agent／subagent breakdown。`--all-projects` 顯示 project overview 與各 project 的 agent breakdown；terminal 預設顯示 top 10 projects／agents，使用 `--top-projects 0 --top-agents 0` 顯示全部。`--include-cache` 將 cache read／write tokens 納入顯示 token 數；JSON 會保留完整 breakdown。call count 是 assistant model responses，`compaction` 維護訊息不計入 CTA dashboard。
+dashboard 預設顯示目前 project 最近 7 天的 calls、sessions、active tokens 與 agent／subagent breakdown，也會顯示 parent → subagent 的 spawn、calls 與 token 關係。`--all-projects` 顯示 project overview 與各 project 的 breakdown；terminal 預設顯示 top 10 projects／agents／relationships，使用 `--top-projects 0 --top-agents 0 --top-relationships 0` 顯示全部。`--include-cache` 將 cache read／write tokens 納入顯示 token 數；JSON 會保留完整 breakdown。call count 是 assistant model responses，`compaction` 維護訊息不計入 CTA dashboard。
 
 dashboard 只掃描指定日期範圍的 `message` 與必要的 `session` metadata，不讀取大型 `part` content。all-project 查詢若未建立 optional time index，可能掃描整張 message table；可在確認會修改第三方 database 後執行 `ai-monitor opencode optimize create --yes`。
 
@@ -299,7 +299,7 @@ ai-monitor codex logout --profile work
 | Command | Options | 行為 |
 | --- | --- | --- |
 | `opencode usage` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-models <N>` 預設 `10` | Read-only usage report；省略 project 時使用目前工作目錄 |
-| `opencode dashboard` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-projects <N>` 預設 `10`；`--top-agents <N>` 預設 `10` | 依 project、agent／subagent 顯示 calls、sessions、tokens 與 share；`0` 代表不限制 |
+| `opencode dashboard` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-projects <N>`、`--top-agents <N>`、`--top-relationships <N>` 預設 `10` | 依 project、agent／subagent 與 parent relationship 顯示 calls、sessions、tokens 與 share；`0` 代表不限制 |
 | `opencode optimize status` | `--db <PATH>` 位於 `optimize` 前 | Read-only 檢查 `ai-monitor` index 是否存在 |
 | `opencode optimize create` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 建立 `ai_monitor_message_time_created_idx`，直接修改第三方 DB |
 | `opencode optimize remove` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 移除 `ai-monitor` 自己的 index，直接修改第三方 DB |

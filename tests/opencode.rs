@@ -188,6 +188,14 @@ fn dashboard_aggregates_projects_agents_and_subagents() {
     assert_eq!(general.kind, "subagent");
     assert_eq!(general.usage.calls, 1);
     assert_eq!(general.usage.active_tokens(), 12);
+
+    assert_eq!(report.projects[0].relationships.len(), 1);
+    let relationship = &report.projects[0].relationships[0];
+    assert_eq!(relationship.parent, "build");
+    assert_eq!(relationship.subagent, "general");
+    assert_eq!(relationship.usage.sessions, 1);
+    assert_eq!(relationship.usage.calls, 1);
+    assert_eq!(relationship.usage.active_tokens(), 12);
 }
 
 #[test]

@@ -61,12 +61,20 @@ pub struct DashboardProject {
     pub path: String,
     pub usage: BreakdownUsage,
     pub agents: Vec<DashboardAgent>,
+    pub relationships: Vec<DashboardRelationship>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DashboardAgent {
     pub name: String,
     pub kind: String,
+    pub usage: BreakdownUsage,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardRelationship {
+    pub parent: String,
+    pub subagent: String,
     pub usage: BreakdownUsage,
 }
 
@@ -179,19 +187,27 @@ impl OpenCodeProvider {
         let session_columns = table_columns(&connection, "session")?;
         let mut totals = DashboardAggregate::default();
         let mut projects = HashMap::<String, DashboardAggregateProject>::new();
+        let mut session_agents = HashMap::<String, HashMap<String, u64>>::new();
+        let mut declared_agents = HashMap::<String, String>::new();
         stream_dashboard_rows(
             &connection,
-            &range,
-            project_id.as_deref(),
-            &session_columns,
-            &project_metadata,
-            &mut totals,
-            &mut projects,
+            DashboardQuery {
+                range: &range,
+                project_id: project_id.as_deref(),
+                session_columns: &session_columns,
+                project_metadata: &project_metadata,
+            },
+            &mut DashboardAccumulator {
+                totals: &mut totals,
+                projects: &mut projects,
+                session_agents: &mut session_agents,
+                declared_agents: &mut declared_agents,
+            },
         )?;
 
         let mut projects = projects
             .into_iter()
-            .map(|(id, project)| project.finish(id))
+            .map(|(id, project)| project.finish(id, &session_agents, &declared_agents))
             .collect::<Vec<_>>();
         let include_path = project_path
             .map(|path| path.to_string_lossy().into_owned())
@@ -473,6 +489,12 @@ struct DashboardAgentKey {
     kind: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DashboardRelationshipKey {
+    parent_session_id: String,
+    subagent: String,
+}
+
 #[derive(Default)]
 struct DashboardAggregate {
     usage: BreakdownUsage,
@@ -497,6 +519,7 @@ struct DashboardAggregateProject {
     path: String,
     usage: DashboardAggregate,
     agents: HashMap<DashboardAgentKey, DashboardAggregate>,
+    relationships: HashMap<DashboardRelationshipKey, DashboardAggregate>,
 }
 
 impl DashboardAggregateProject {
@@ -506,10 +529,16 @@ impl DashboardAggregateProject {
             path,
             usage: DashboardAggregate::default(),
             agents: HashMap::new(),
+            relationships: HashMap::new(),
         }
     }
 
-    fn finish(self, id: String) -> DashboardProject {
+    fn finish(
+        self,
+        id: String,
+        session_agents: &HashMap<String, HashMap<String, u64>>,
+        declared_agents: &HashMap<String, String>,
+    ) -> DashboardProject {
         let mut agents = self
             .agents
             .into_iter()
@@ -526,62 +555,100 @@ impl DashboardAggregateProject {
                 .cmp(&left.usage.active_tokens())
                 .then_with(|| left.name.cmp(&right.name))
         });
+        let mut relationships = self
+            .relationships
+            .into_iter()
+            .map(|(key, aggregate)| DashboardRelationship {
+                parent: dominant_agent(&key.parent_session_id, session_agents, declared_agents),
+                subagent: key.subagent,
+                usage: aggregate.finish(),
+            })
+            .collect::<Vec<_>>();
+        relationships.sort_by(|left, right| {
+            right
+                .usage
+                .active_tokens()
+                .cmp(&left.usage.active_tokens())
+                .then_with(|| left.parent.cmp(&right.parent))
+                .then_with(|| left.subagent.cmp(&right.subagent))
+        });
         DashboardProject {
             id,
             name: self.name,
             path: self.path,
             usage: self.usage.finish(),
             agents,
+            relationships,
         }
     }
 }
 
 type ProjectMetadata = HashMap<String, (String, String)>;
 
+struct DashboardQuery<'a> {
+    range: &'a DateRange,
+    project_id: Option<&'a str>,
+    session_columns: &'a HashSet<String>,
+    project_metadata: &'a ProjectMetadata,
+}
+
+struct DashboardAccumulator<'a> {
+    totals: &'a mut DashboardAggregate,
+    projects: &'a mut HashMap<String, DashboardAggregateProject>,
+    session_agents: &'a mut HashMap<String, HashMap<String, u64>>,
+    declared_agents: &'a mut HashMap<String, String>,
+}
+
 fn stream_dashboard_rows(
     connection: &Connection,
-    range: &DateRange,
-    project_id: Option<&str>,
-    session_columns: &HashSet<String>,
-    project_metadata: &ProjectMetadata,
-    totals: &mut DashboardAggregate,
-    projects: &mut HashMap<String, DashboardAggregateProject>,
+    query_context: DashboardQuery<'_>,
+    accumulator: &mut DashboardAccumulator<'_>,
 ) -> Result<()> {
-    let parent_expression = if session_columns.contains("parent_id") {
+    let parent_expression = if query_context.session_columns.contains("parent_id") {
         "s.parent_id"
     } else {
         "NULL"
     };
-    let session_agent_expression = if session_columns.contains("agent") {
+    let session_agent_expression = if query_context.session_columns.contains("agent") {
         "s.agent"
     } else {
         "NULL"
     };
-    let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match project_id {
+    let parent_agent_expression = if query_context.session_columns.contains("agent") {
+        "parent_session.agent"
+    } else {
+        "NULL"
+    };
+    let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match query_context.project_id {
         Some(project_id) => (
             format!(
-                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression} \
+                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression}, {parent_agent_expression} \
                  FROM message AS m \
                  JOIN session AS s ON s.id = m.session_id \
+                 LEFT JOIN session AS parent_session ON parent_session.id = s.parent_id \
                  WHERE m.time_created >= ?1 \
                    AND m.time_created < ?2 \
                    AND s.project_id = ?3"
             ),
             vec![
-                Box::new(range.start_millis),
-                Box::new(range.end_millis),
+                Box::new(query_context.range.start_millis),
+                Box::new(query_context.range.end_millis),
                 Box::new(project_id.to_owned()),
             ],
         ),
         None => (
             format!(
-                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression} \
+                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression}, {parent_agent_expression} \
                  FROM message AS m \
                  JOIN session AS s ON s.id = m.session_id \
+                 LEFT JOIN session AS parent_session ON parent_session.id = s.parent_id \
                  WHERE m.time_created >= ?1 \
                    AND m.time_created < ?2"
             ),
-            vec![Box::new(range.start_millis), Box::new(range.end_millis)],
+            vec![
+                Box::new(query_context.range.start_millis),
+                Box::new(query_context.range.end_millis),
+            ],
         ),
     };
 
@@ -609,6 +676,17 @@ fn stream_dashboard_rows(
         let directory = text_value(row.get_ref(3).map_err(Error::Query)?).unwrap_or_default();
         let parent_id = text_value(row.get_ref(4).map_err(Error::Query)?);
         let session_agent = text_value(row.get_ref(5).map_err(Error::Query)?);
+        let parent_agent = text_value(row.get_ref(6).map_err(Error::Query)?);
+        if let Some(session_agent) = session_agent.as_deref() {
+            accumulator
+                .declared_agents
+                .insert(session_id.clone(), session_agent.to_owned());
+        }
+        if let (Some(parent_id), Some(parent_agent)) = (parent_id.as_deref(), parent_agent) {
+            accumulator
+                .declared_agents
+                .insert(parent_id.to_owned(), parent_agent);
+        }
         let agent = find_string(&value, AGENT_PATHS)
             .or(session_agent)
             .unwrap_or_else(|| "unknown".to_owned());
@@ -620,7 +698,8 @@ fn stream_dashboard_rows(
         } else {
             "agent"
         };
-        let (metadata_name, metadata_path) = project_metadata
+        let (metadata_name, metadata_path) = query_context
+            .project_metadata
             .get(&project_id)
             .cloned()
             .unwrap_or_else(|| (String::new(), directory));
@@ -630,19 +709,37 @@ fn stream_dashboard_rows(
             metadata_path
         };
         let name = project_name(&project_id, &path, &metadata_name);
-        let project = projects
+        let project = accumulator
+            .projects
             .entry(project_id.clone())
             .or_insert_with(|| DashboardAggregateProject::new(name, path));
         project.usage.add_call(&session_id, &usage);
+        accumulator
+            .session_agents
+            .entry(session_id.clone())
+            .or_default()
+            .entry(agent.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
         project
             .agents
             .entry(DashboardAgentKey {
-                name: agent,
+                name: agent.clone(),
                 kind: kind.to_owned(),
             })
             .or_default()
             .add_call(&session_id, &usage);
-        totals.add_call(&session_id, &usage);
+        if let Some(parent_id) = parent_id {
+            project
+                .relationships
+                .entry(DashboardRelationshipKey {
+                    parent_session_id: parent_id,
+                    subagent: agent,
+                })
+                .or_default()
+                .add_call(&session_id, &usage);
+        }
+        accumulator.totals.add_call(&session_id, &usage);
     }
     Ok(())
 }
@@ -660,6 +757,23 @@ fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>
         columns.insert(row.get::<_, String>(1).map_err(Error::Query)?);
     }
     Ok(columns)
+}
+
+fn dominant_agent(
+    session_id: &str,
+    session_agents: &HashMap<String, HashMap<String, u64>>,
+    declared_agents: &HashMap<String, String>,
+) -> String {
+    session_agents
+        .get(session_id)
+        .and_then(|agents| {
+            agents
+                .iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(agent, _)| agent.clone())
+        })
+        .or_else(|| declared_agents.get(session_id).cloned())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn load_project_metadata(connection: &Connection) -> Result<ProjectMetadata> {

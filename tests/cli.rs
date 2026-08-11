@@ -64,5 +64,6 @@ fn opencode_dashboard_help_exposes_breakdown_options() {
         .success()
         .stdout(predicate::str::contains("--all-projects"))
         .stdout(predicate::str::contains("--top-projects"))
-        .stdout(predicate::str::contains("--top-agents"));
+        .stdout(predicate::str::contains("--top-agents"))
+        .stdout(predicate::str::contains("--top-relationships"));
 }

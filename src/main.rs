@@ -209,6 +209,8 @@ enum OpenCodeCommands {
         top_projects: usize,
         #[arg(long, default_value_t = 10)]
         top_agents: usize,
+        #[arg(long, default_value_t = 10)]
+        top_relationships: usize,
     },
     /// Manage the optional all-project time index.
     Optimize {
@@ -506,6 +508,7 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
             include_cache,
             top_projects,
             top_agents,
+            top_relationships,
         } => {
             let provider = provider(db);
             let report = provider
@@ -516,7 +519,14 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
                     "warning: all-project dashboard queries may scan the entire message table; run `ai-monitor opencode optimize create --yes` to add the optional time index"
                 );
             }
-            output_dashboard(format, &report, include_cache, top_projects, top_agents)
+            output_dashboard(
+                format,
+                &report,
+                include_cache,
+                top_projects,
+                top_agents,
+                top_relationships,
+            )
         }
         OpenCodeCommands::Optimize { action, db } => {
             let provider = provider(db);
@@ -920,6 +930,7 @@ fn output_dashboard(
     include_cache: bool,
     top_projects: usize,
     top_agents: usize,
+    top_relationships: usize,
 ) -> Result<()> {
     if matches!(format, OutputFormat::Json) {
         return output_value(format, report);
@@ -976,6 +987,41 @@ fn output_dashboard(
         if agent_count < project.agents.len() {
             println!("Showing top {agent_count} agents; use --top-agents 0 for all.");
         }
+    }
+
+    println!("\nPRIMARY -> SUBAGENT RELATIONSHIPS");
+    let mut printed_relationships = false;
+    for project in report.projects.iter().take(project_count) {
+        if project.relationships.is_empty() {
+            continue;
+        }
+        printed_relationships = true;
+        println!("\n{} ({})", project.name, project.path);
+        println!(
+            "PARENT                         SUBAGENT                 SPAWNS     CALLS      TOKENS   SHARE"
+        );
+        let relationship_count = limited_count(project.relationships.len(), top_relationships);
+        let project_tokens = dashboard_tokens(&project.usage, include_cache);
+        for relationship in project.relationships.iter().take(relationship_count) {
+            let tokens = dashboard_tokens(&relationship.usage, include_cache);
+            println!(
+                "{:<30} {:<24} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+                truncate(&relationship.parent, 30),
+                truncate(&relationship.subagent, 24),
+                relationship.usage.sessions,
+                relationship.usage.calls,
+                compact(tokens),
+                dashboard_share(tokens, project_tokens),
+            );
+        }
+        if relationship_count < project.relationships.len() {
+            println!(
+                "Showing top {relationship_count} relationships; use --top-relationships 0 for all."
+            );
+        }
+    }
+    if !printed_relationships {
+        println!("No parent-subagent session relationships found in this range.");
     }
     Ok(())
 }
