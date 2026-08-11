@@ -1002,7 +1002,7 @@ fn output_codex_dashboard(
     println!("╰{}╯", "─".repeat(width));
     println!();
     println!("{}", theme.paint("ACCOUNT OVERVIEW", BOLD));
-    println!("  > PROFILE       STATUS       USAGE       RESET                 CREDITS");
+    println!("  > PROFILE       STATUS       USED        RESET                 CREDITS");
     for result in results {
         render_account_summary(&theme, result, selected);
     }
@@ -1121,8 +1121,17 @@ fn render_account_card(
     }
     for limit in &snapshot.limits {
         let (usage, usage_code) = limit_usage(limit);
+        let remaining_percent = 100.0 - usage;
+        let remaining_code = if remaining_percent <= 10.0 {
+            RED
+        } else if remaining_percent <= 25.0 {
+            YELLOW
+        } else {
+            GREEN
+        };
         let bar = theme.paint(progress_bar(usage, 24), usage_code);
-        let percentage = theme.paint(format!("{usage:>5.1}%"), usage_code);
+        let used = theme.paint(format!("{usage:>5.1}%"), usage_code);
+        let remaining = theme.paint(format!("{remaining_percent:>5.1}%"), remaining_code);
         let reset = limit
             .resets_at
             .map(format_reset_time)
@@ -1131,12 +1140,16 @@ fn render_account_card(
             theme,
             width,
             &format!(
-                "   {:<9} {} {}  reset {}",
+                "   {:<9} used {}  remaining {}",
                 limit_label(limit),
-                bar,
-                percentage,
-                reset
+                used,
+                remaining
             ),
+        );
+        card_line(
+            theme,
+            width,
+            &format!("             {}  reset {}", bar, reset),
         );
     }
     card_line(theme, width, "");
