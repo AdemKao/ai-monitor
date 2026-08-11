@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.3.1`  
+目前版本：`v0.3.2`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
@@ -11,7 +11,7 @@ Repository：<https://github.com/AdemKao/ai-monitor>
 - `codex` 管理隔離 profile，透過官方 Codex CLI 登入、登出與執行命令，並讀取 account、rate limits、usage 與 reset credits。
 - `codex usage` 會顯示多帳號 dashboard：帳號數量、各帳號用量、reset 時間、reset credit 與 expiry 狀態。
 - terminal dashboard 會以進度條與顏色標示高用量、即將到期與已過期項目；可用 `--color always|never` 控制顏色。
-- `codex credits` 與 `codex expiring` 預設只使用 Codex app-server 回傳的資料；private endpoint fallback 必須明確 opt-in。
+- `codex credits`、`codex expiring`、`codex usage` 與 `codex all` 預設會查詢 reset credits；可用 `--no-private-api` 停用 private endpoint fallback。
 - `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
 - `update` 直接從 GitHub Release 檢查、驗證 checksum 並更新目前的 `ai-monitor` binary，不需要 local checkout。
@@ -40,7 +40,7 @@ installer 預設安裝到 Cargo binary 目錄，通常是 `~/.cargo/bin`。執�
 
 ### 更新已安裝版本
 
-一般使用者不需要用 local checkout 或 `cargo install` 更新。已安裝 v0.3.0 後，直接執行：
+一般使用者不需要用 local checkout 或 `cargo install` 更新。已安裝舊版後，直接執行：
 
 ```sh
 ai-monitor update
@@ -67,7 +67,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 從指定 Git tag 安裝（開發者用途）：
 
 ```sh
-cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.3.1 ai-monitor
+cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.3.2 ai-monitor
 ```
 
 在本機 checkout 安裝目前原始碼：
@@ -161,18 +161,18 @@ ai-monitor codex login work --force
 ```sh
 ai-monitor codex credits --profile work
 ai-monitor codex expiring --profile work --days 7
-ai-monitor codex usage --allow-private-api
 ai-monitor --color always codex usage
 ```
 
-預設不呼叫 private credits endpoint。只有明確加入 `--allow-private-api` 時，`credits`／`expiring` 才會在 app-server 沒有詳細 credit list 時嘗試 fallback：
+預設會在 app-server 沒有詳細 credit list 時查詢 private credits endpoint。若不希望傳送 profile token 到該 endpoint，可使用：
 
 ```sh
-ai-monitor codex credits --profile work --allow-private-api
-ai-monitor codex expiring --profile work --days 7 --allow-private-api
+ai-monitor codex credits --profile work --no-private-api
+ai-monitor codex expiring --profile work --days 7 --no-private-api
+ai-monitor codex all --no-private-api
 ```
 
-這個 fallback 會讀取該 profile 的 `auth.json`，以 bearer token 直接請求 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。每個 eligible profile 每次 command 最多請求一次；指定 `--profile` 時只會對 selected profile 執行 private fallback。這是 ChatGPT/Codex 的 private、非官方公開 API，不保證穩定或允許第三方使用；它可能傳送帳號 token 到該 endpoint。除非你理解風險，請不要使用 `--allow-private-api`。
+這個 fallback 會讀取該 profile 的 `auth.json`，以 bearer token 直接請求 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。每個 eligible profile 每次 command 最多請求一次；指定 `--profile` 時只會對 selected profile 執行 private fallback。這是 ChatGPT/Codex 的 private、非官方公開 API，不保證穩定或允許第三方使用；它可能傳送帳號 token 到該 endpoint。`--allow-private-api` 仍可接受，但只是舊版相容參數，現在不再需要。
 
 若 endpoint 回傳 HTTP 429，代表服務端 rate limit，不代表本機 auth 解析失敗。ai-monitor 不會自動密集 retry，請等待後再試。
 
@@ -256,7 +256,7 @@ ai-monitor codex logout --profile work
 
 | Command | Options | 行為 |
 | --- | --- | --- |
-| `overview` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>` | 合併 Codex limits 與 OpenCode usage |
+| `overview` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--no-private-api` | 合併 Codex limits 與 OpenCode usage |
 | `codex` | 見下表 | Codex profile、帳號與 limits |
 | `opencode` | 見下表 | OpenCode usage 與 optional index |
 | `doctor` | 無 | 檢查 binary 與本機 storage path |
@@ -270,10 +270,10 @@ ai-monitor codex logout --profile work
 | `codex profiles` | 無 | 列出 profiles、default 標記與 auth 狀態 |
 | `codex default <NAME>` | 無 | 設定 default profile |
 | `codex login <NAME>` | `--force` | 建立／重做隔離 profile 的官方 Codex login |
-| `codex usage` | `--profile <PROFILE>`；`--allow-private-api` | 顯示所有帳號摘要與視覺化 rate limits；指定 profile 時標記 selected |
-| `codex credits` | `--profile <PROFILE>`；`--allow-private-api` | 顯示 reset credits；private fallback 需 opt-in |
-| `codex expiring` | `--profile <PROFILE>`；`--days <DAYS>` 預設 `7`；`--allow-private-api` | 尋找指定天數內到期的 active／available credits；省略 profile 時掃描所有 profiles |
-| `codex all` | `--allow-private-api` | 顯示所有 profiles 的視覺化 dashboard |
+| `codex usage` | `--profile <PROFILE>`；`--no-private-api` | 顯示所有帳號摘要與視覺化 rate limits；指定 profile 時標記 selected |
+| `codex credits` | `--profile <PROFILE>`；`--no-private-api` | 顯示 reset credits；預設啟用 private fallback |
+| `codex expiring` | `--profile <PROFILE>`；`--days <DAYS>` 預設 `7`；`--no-private-api` | 尋找指定天數內到期的 active／available credits；省略 profile 時掃描所有 profiles |
+| `codex all` | `--no-private-api` | 顯示所有 profiles 的視覺化 dashboard |
 | `codex run` | `--profile <PROFILE>`；其餘 args | 以 profile 的 `CODEX_HOME` 執行官方 Codex CLI |
 | `codex logout` | `--profile <PROFILE>` | 透過官方 Codex CLI 清除 profile credentials |
 
@@ -313,7 +313,7 @@ profile 目錄位於 `<root>/profiles/<name>`。profile name 只允許 ASCII let
 
 - OpenCode `usage` 與 `optimize status` 只讀本機資料；`optimize create/remove` 是明確的第三方 database 寫入操作，且必須 `--yes`。
 - Codex `login`、`run`、`logout` 與 `app-server` 是委派給官方 Codex CLI 的操作；其網路與帳號行為以 Codex CLI 為準。
-- `codex credits`／`expiring` 的 private fallback 只有在使用者加入 `--allow-private-api` 時才會執行，且 endpoint 不是官方公開 API。
+- Codex reset-credit commands 預設可能讀取 `auth.json` 並將 bearer token 傳送到 private endpoint；使用 `--no-private-api` 可停用此 fallback。`--allow-private-api` 是舊版相容參數。
 - ai-monitor 沒有 telemetry；但 command 可能輸出 account email、model、成本、檔案路徑與 rate-limit 資訊，請保護 terminal history、JSON 檔案與 log。
 - OpenCode database 與 Codex `auth.json` 都可能包含敏感資料。請只授予必要權限，並在 `optimize create/remove` 前自行備份。
 

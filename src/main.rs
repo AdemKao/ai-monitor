@@ -15,7 +15,7 @@ use ai_monitor::opencode::{OpenCodeProvider, discover_db_path};
 use ai_monitor::update;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
 use serde_json::json;
@@ -33,6 +33,22 @@ struct Cli {
     color: ColorMode,
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Debug, Args)]
+struct PrivateApiOptions {
+    /// Skip the private reset-credit endpoint.
+    #[arg(long)]
+    no_private_api: bool,
+    /// Deprecated compatibility flag; private lookup is enabled by default.
+    #[arg(long, hide = true)]
+    allow_private_api: bool,
+}
+
+impl PrivateApiOptions {
+    fn enabled(&self) -> bool {
+        self.allow_private_api || !self.no_private_api
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -62,6 +78,8 @@ enum Commands {
         project: Option<PathBuf>,
         #[arg(long)]
         db: Option<PathBuf>,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
     },
     /// Inspect Codex accounts and subscription limits.
     Codex {
@@ -112,15 +130,15 @@ enum CodexCommands {
     Usage {
         #[arg(long)]
         profile: Option<String>,
-        #[arg(long)]
-        allow_private_api: bool,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
     },
-    /// Show reset credits. Private fallback requires explicit opt-in.
+    /// Show reset credits. Private lookup is enabled by default.
     Credits {
         #[arg(long)]
         profile: Option<String>,
-        #[arg(long)]
-        allow_private_api: bool,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
     },
     /// Find reset credits expiring soon.
     Expiring {
@@ -128,13 +146,13 @@ enum CodexCommands {
         profile: Option<String>,
         #[arg(long, default_value_t = 7)]
         days: u32,
-        #[arg(long)]
-        allow_private_api: bool,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
     },
     /// Show all profiles and limits.
     All {
-        #[arg(long)]
-        allow_private_api: bool,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
     },
     /// Run Codex with an isolated profile.
     Run {
@@ -221,7 +239,16 @@ fn run() -> Result<()> {
             all_projects,
             project,
             db,
-        } => run_overview(cli.format, cli.color, days, all_projects, project, db),
+            private_api,
+        } => run_overview(
+            cli.format,
+            cli.color,
+            days,
+            all_projects,
+            project,
+            db,
+            private_api.enabled(),
+        ),
         Commands::Codex { command } => run_codex(cli.format, cli.color, command),
         Commands::Opencode { command } => run_opencode(cli.format, command),
         Commands::Doctor => run_doctor(cli.format),
@@ -533,34 +560,30 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
         }
         CodexCommands::Usage {
             profile,
-            allow_private_api,
+            private_api,
         } => {
             if let Some(name) = profile.as_deref() {
                 store.resolve(Some(name))?;
             }
-            let results = fetch_all(&store, allow_private_api, profile.as_deref())?;
-            output_codex_dashboard(
-                format,
-                &results,
-                profile.as_deref(),
-                color,
-                allow_private_api,
-            )?;
+            let use_private_api = private_api.enabled();
+            let results = fetch_all(&store, use_private_api, profile.as_deref())?;
+            output_codex_dashboard(format, &results, profile.as_deref(), color, use_private_api)?;
         }
         CodexCommands::Credits {
             profile,
-            allow_private_api,
+            private_api,
         } => {
             let profile = store.resolve(profile.as_deref())?;
             let snapshot = fetch(&profile)?;
-            let credits = detailed_credits(&profile, &snapshot, allow_private_api)?;
+            let credits = detailed_credits(&profile, &snapshot, private_api.enabled())?;
             output_credits(format, &profile.name, &credits)?;
         }
         CodexCommands::Expiring {
             profile,
             days,
-            allow_private_api,
+            private_api,
         } => {
+            let use_private_api = private_api.enabled();
             let profiles = match profile {
                 Some(name) => vec![store.resolve(Some(&name))?],
                 None => store.list()?,
@@ -570,8 +593,7 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
             for profile in profiles {
                 match fetch(&profile) {
                     Ok(snapshot) => {
-                        let credits = match detailed_credits(&profile, &snapshot, allow_private_api)
-                        {
+                        let credits = match detailed_credits(&profile, &snapshot, use_private_api) {
                             Ok(credits) => credits,
                             Err(error) => {
                                 errors.push(format!("{}: {error}", profile.name));
@@ -582,10 +604,10 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
                             errors.push(format!(
                                 "{}: reset-credit details unavailable{}",
                                 profile.name,
-                                if allow_private_api {
+                                if use_private_api {
                                     ""
                                 } else {
-                                    "; retry with --allow-private-api only if you accept the private endpoint risk"
+                                    "; retry without --no-private-api to query the private endpoint"
                                 }
                             ));
                             continue;
@@ -618,9 +640,10 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
                 }
             }
         }
-        CodexCommands::All { allow_private_api } => {
-            let results = fetch_all(&store, allow_private_api, None)?;
-            output_codex_dashboard(format, &results, None, color, allow_private_api)?;
+        CodexCommands::All { private_api } => {
+            let use_private_api = private_api.enabled();
+            let results = fetch_all(&store, use_private_api, None)?;
+            output_codex_dashboard(format, &results, None, color, use_private_api)?;
         }
         CodexCommands::Run { profile, args } => {
             let profile = store.resolve(profile.as_deref())?;
@@ -642,14 +665,14 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
 
 fn fetch_all(
     store: &ProfileStore,
-    allow_private_api: bool,
+    use_private_api: bool,
     private_profile: Option<&str>,
 ) -> Result<Vec<ProfileResult>> {
     Ok(store
         .list()?
         .into_iter()
         .map(|profile| {
-            let allow_private_for_profile = allow_private_api
+            let allow_private_for_profile = use_private_api
                 && private_profile
                     .map(|selected| selected == profile.name)
                     .unwrap_or(true);
@@ -658,7 +681,7 @@ fn fetch_all(
         .collect())
 }
 
-fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
+fn fetch_profile(profile: &Profile, use_private_api: bool) -> ProfileResult {
     if !profile.authenticated {
         return ProfileResult {
             profile: profile.name.clone(),
@@ -672,7 +695,7 @@ fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
     match fetch(profile) {
         Ok(mut snapshot) => {
             let mut credit_error = None;
-            if allow_private_api && snapshot.reset_credits.credits.is_none() {
+            if use_private_api && snapshot.reset_credits.credits.is_none() {
                 match detailed_credits(profile, &snapshot, true) {
                     Ok(credits) => snapshot.reset_credits = credits,
                     Err(error) => credit_error = Some(error.to_string()),
@@ -703,13 +726,14 @@ fn run_overview(
     all_projects: bool,
     project: Option<PathBuf>,
     db: Option<PathBuf>,
+    use_private_api: bool,
 ) -> Result<()> {
     let report = provider(db)
         .usage(days, all_projects, project.as_deref())
         .context("failed to read OpenCode usage")?;
     let codex = ProfileStore::from_env()
         .map_err(anyhow::Error::from)
-        .and_then(|store| fetch_all(&store, false, None))
+        .and_then(|store| fetch_all(&store, use_private_api, None))
         .unwrap_or_else(|error| {
             vec![ProfileResult {
                 profile: "codex".to_owned(),
@@ -723,7 +747,7 @@ fn run_overview(
         output_value(format, &json!({"opencode": report, "codex": codex}))
     } else {
         println!("CODEX");
-        output_codex_dashboard(OutputFormat::Terminal, &codex, None, color, false)?;
+        output_codex_dashboard(OutputFormat::Terminal, &codex, None, color, use_private_api)?;
         println!("\nOPENCODE");
         output_usage(format, &report, false, 10)
     }
@@ -926,7 +950,7 @@ fn output_codex_dashboard(
     results: &[ProfileResult],
     selected: Option<&str>,
     color: ColorMode,
-    allow_private_api: bool,
+    use_private_api: bool,
 ) -> Result<()> {
     if matches!(format, OutputFormat::Json) {
         return output_value(
@@ -981,15 +1005,15 @@ fn output_codex_dashboard(
         println!("  No Codex accounts found. Run `ai-monitor codex login NAME`.");
     }
     for result in results {
-        render_account_card(&theme, result, selected, allow_private_api, width);
+        render_account_card(&theme, result, selected, use_private_api, width);
     }
 
-    if !allow_private_api && results.iter().any(missing_credit_details) {
+    if !use_private_api && results.iter().any(missing_credit_details) {
         println!();
         println!(
             "{}",
             theme.paint(
-                "Note: some reset-credit expiry dates are unavailable. Use --allow-private-api only if you accept the private endpoint risk.",
+                "Note: private reset-credit lookup is disabled by --no-private-api.",
                 YELLOW,
             )
         );
@@ -1042,7 +1066,7 @@ fn render_account_card(
     theme: &Theme,
     result: &ProfileResult,
     selected: Option<&str>,
-    allow_private_api: bool,
+    use_private_api: bool,
     width: usize,
 ) {
     let selected_marker = if selected == Some(result.profile.as_str()) {
@@ -1121,7 +1145,7 @@ fn render_account_card(
     render_credit_details(
         theme,
         &snapshot.reset_credits,
-        allow_private_api,
+        use_private_api,
         result.credit_error.as_deref(),
         width,
     );
@@ -1142,7 +1166,7 @@ fn card_line(_theme: &Theme, width: usize, content: &str) {
 fn render_credit_details(
     theme: &Theme,
     credits: &ResetCredits,
-    allow_private_api: bool,
+    use_private_api: bool,
     detail_error: Option<&str>,
     width: usize,
 ) {
@@ -1167,10 +1191,10 @@ fn render_credit_details(
         None => {
             let hint = if let Some(error) = detail_error {
                 error
-            } else if allow_private_api {
+            } else if use_private_api {
                 "Private credit detail lookup failed or returned no rows"
             } else {
-                "Expiry details require --allow-private-api"
+                "Private credit lookup disabled by --no-private-api"
             };
             card_line(theme, width, &theme.paint(format!("   {hint}"), YELLOW));
         }
@@ -1378,4 +1402,33 @@ fn truncate(value: &str, width: usize) -> String {
         .take(width.saturating_sub(1))
         .collect::<String>()
         + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_credit_lookup_is_enabled_by_default() {
+        let cli = Cli::try_parse_from(["ai-monitor", "codex", "all"]).unwrap();
+        let Commands::Codex {
+            command: CodexCommands::All { private_api },
+        } = cli.command
+        else {
+            panic!("expected codex all command");
+        };
+        assert!(private_api.enabled());
+    }
+
+    #[test]
+    fn private_credit_lookup_can_be_disabled() {
+        let cli = Cli::try_parse_from(["ai-monitor", "codex", "all", "--no-private-api"]).unwrap();
+        let Commands::Codex {
+            command: CodexCommands::All { private_api },
+        } = cli.command
+        else {
+            panic!("expected codex all command");
+        };
+        assert!(!private_api.enabled());
+    }
 }

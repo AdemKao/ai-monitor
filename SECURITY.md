@@ -23,5 +23,5 @@
 
 - OpenCode `usage` 與 `optimize status` 是唯讀操作。
 - `opencode optimize create --yes` 與 `remove --yes` 會直接修改第三方 OpenCode database，只建立或移除 `ai_monitor_message_time_created_idx`；執行前請自行備份。
-- Codex private credits fallback 只有在明確指定 `--allow-private-api` 時才會使用 private endpoint，且該 endpoint 不是官方公開 API。
+- Codex reset-credit commands 預設可能讀取 `auth.json` 並將 bearer token 傳送到 private endpoint；使用 `--no-private-api` 可停用 fallback。該 endpoint 不是官方公開 API。
 - `chatgpt-status` alias 只提供 command prefix compatibility，不保證舊版 flags、輸出或資料遷移行為。

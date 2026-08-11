@@ -30,7 +30,8 @@ fn generates_shell_completion() {
         .args(["completion", "zsh"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("#compdef ai-monitor"));
+        .stdout(predicate::str::contains("#compdef ai-monitor"))
+        .stdout(predicate::str::contains("--no-private-api"));
 }
 
 #[test]
@@ -40,5 +41,5 @@ fn codex_usage_help_exposes_dashboard_options() {
         .args(["codex", "usage", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--allow-private-api"));
+        .stdout(predicate::str::contains("--no-private-api"));
 }
