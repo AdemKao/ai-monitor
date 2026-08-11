@@ -2,13 +2,15 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.1.0`  
+目前版本：`v0.2.0`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
 
 - `overview` 同時顯示 Codex limits 與 OpenCode usage。
 - `codex` 管理隔離 profile，透過官方 Codex CLI 登入、登出與執行命令，並讀取 account、rate limits、usage 與 reset credits。
+- `codex usage` 會顯示多帳號 dashboard：帳號數量、各帳號用量、reset 時間、reset credit 與 expiry 狀態。
+- terminal dashboard 會以進度條與顏色標示高用量、即將到期與已過期項目；可用 `--color always|never` 控制顏色。
 - `codex credits` 與 `codex expiring` 預設只使用 Codex app-server 回傳的資料；private endpoint fallback 必須明確 opt-in。
 - `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
@@ -34,12 +36,24 @@ irm https://github.com/AdemKao/ai-monitor/releases/latest/download/ai-monitor-in
 
 installer 預設安裝到 Cargo binary 目錄，通常是 `~/.cargo/bin`。執行 `curl | sh` 或 `irm | iex` 前，請先檢查 release 頁面的 SHA-256 checksum；不信任的環境應先下載、檢閱 script，再執行它。
 
-### Cargo
+### 更新已安裝版本
 
-從 `v0.1.0` Git tag 安裝：
+一般使用者不要用 local checkout 覆蓋安裝。每次 release 後，重新執行同一個 latest installer 即可安全更新；它會替換 binary，不會搬移或刪除 Codex profiles、OpenCode database 或 auth。
 
 ```sh
-cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.1.0 ai-monitor
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/AdemKao/ai-monitor/releases/latest/download/ai-monitor-installer.sh | sh
+ai-monitor --version
+```
+
+需要固定版本時，將 `latest` 改成版本 tag，例如 `v0.2.0`。更新後若目前 shell 找不到新 binary，執行 `rehash` 或重新開啟 terminal。`cargo install --path .` 僅供專案開發與測試，不是一般使用者的更新方式。
+
+### Cargo
+
+從指定 Git tag 安裝（開發者用途）：
+
+```sh
+cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.2.0 ai-monitor
 ```
 
 在本機 checkout 安裝目前原始碼：
@@ -116,10 +130,13 @@ ai-monitor codex profiles
 ai-monitor codex login personal
 ai-monitor codex login work
 ai-monitor codex default work
+ai-monitor codex usage
 ai-monitor codex usage --profile work
 ```
 
 `codex login <NAME>` 會建立隔離 profile，設定該 profile 的 `CODEX_HOME`，再執行官方 `codex login`。若 profile 已有 auth，必須明確使用 `--force` 才會再次登入：
+
+`codex usage` 不指定 profile 時會掃描所有 profiles；指定 `--profile` 時仍會顯示所有帳號摘要，並將指定 profile 標記為 selected。這樣可以一次確認帳號數量與每個帳號狀態。
 
 ```sh
 ai-monitor codex login work --force
@@ -130,6 +147,8 @@ ai-monitor codex login work --force
 ```sh
 ai-monitor codex credits --profile work
 ai-monitor codex expiring --profile work --days 7
+ai-monitor codex usage --allow-private-api
+ai-monitor --color always codex usage
 ```
 
 預設不呼叫 private credits endpoint。只有明確加入 `--allow-private-api` 時，`credits`／`expiring` 才會在 app-server 沒有詳細 credit list 時嘗試 fallback：
@@ -201,11 +220,12 @@ ai-monitor codex logout --profile work
 
 ## Command reference
 
-### Global option
+### Global options
 
 | Syntax | 預設／說明 |
 | --- | --- |
 | `--format <terminal\|json>` | 預設 `terminal`；資料型 command 使用 pretty JSON 輸出 |
+| `--color <auto\|always\|never>` | 預設 `auto`；高用量與 expiry warning 使用 terminal color |
 
 ### Top-level commands
 
@@ -224,10 +244,10 @@ ai-monitor codex logout --profile work
 | `codex profiles` | 無 | 列出 profiles、default 標記與 auth 狀態 |
 | `codex default <NAME>` | 無 | 設定 default profile |
 | `codex login <NAME>` | `--force` | 建立／重做隔離 profile 的官方 Codex login |
-| `codex usage` | `--profile <PROFILE>` | 顯示單一 profile account、rate limits、usage |
+| `codex usage` | `--profile <PROFILE>`；`--allow-private-api` | 顯示所有帳號摘要與視覺化 rate limits；指定 profile 時標記 selected |
 | `codex credits` | `--profile <PROFILE>`；`--allow-private-api` | 顯示 reset credits；private fallback 需 opt-in |
 | `codex expiring` | `--profile <PROFILE>`；`--days <DAYS>` 預設 `7`；`--allow-private-api` | 尋找指定天數內到期的 active／available credits；省略 profile 時掃描所有 profiles |
-| `codex all` | 無 | 顯示所有 profiles 的 app-server snapshot；不使用 private fallback |
+| `codex all` | `--allow-private-api` | 顯示所有 profiles 的視覺化 dashboard |
 | `codex run` | `--profile <PROFILE>`；其餘 args | 以 profile 的 `CODEX_HOME` 執行官方 Codex CLI |
 | `codex logout` | `--profile <PROFILE>` | 透過官方 Codex CLI 清除 profile credentials |
 

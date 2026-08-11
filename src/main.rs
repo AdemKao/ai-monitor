@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::ops::AddAssign;
 use std::path::PathBuf;
 use std::process::Command;
 
 use ai_monitor::codex::{
-    self, ProfileStore, ResetCredits, Snapshot, detailed_credits, expiring, fetch,
+    self, LimitWindow, Profile, ProfileStore, ResetCredit, ResetCredits, Snapshot,
+    detailed_credits, expiring, fetch,
 };
 use ai_monitor::model::{Usage, UsageReport};
 use ai_monitor::opencode::{OpenCodeProvider, discover_db_path};
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
@@ -25,6 +27,8 @@ use serde_json::json;
 struct Cli {
     #[arg(long, value_enum, default_value_t, global = true)]
     format: OutputFormat,
+    #[arg(long, value_enum, default_value_t, global = true)]
+    color: ColorMode,
     #[command(subcommand)]
     command: Commands,
 }
@@ -34,6 +38,14 @@ enum OutputFormat {
     #[default]
     Terminal,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,6 +93,8 @@ enum CodexCommands {
     Usage {
         #[arg(long)]
         profile: Option<String>,
+        #[arg(long)]
+        allow_private_api: bool,
     },
     /// Show reset credits. Private fallback requires explicit opt-in.
     Credits {
@@ -99,7 +113,10 @@ enum CodexCommands {
         allow_private_api: bool,
     },
     /// Show all profiles and limits.
-    All,
+    All {
+        #[arg(long)]
+        allow_private_api: bool,
+    },
     /// Run Codex with an isolated profile.
     Run {
         #[arg(long)]
@@ -161,6 +178,7 @@ enum OptimizeAction {
 #[derive(Serialize)]
 struct ProfileResult {
     profile: String,
+    authenticated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot: Option<Snapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,8 +200,8 @@ fn run() -> Result<()> {
             all_projects,
             project,
             db,
-        } => run_overview(cli.format, days, all_projects, project, db),
-        Commands::Codex { command } => run_codex(cli.format, command),
+        } => run_overview(cli.format, cli.color, days, all_projects, project, db),
+        Commands::Codex { command } => run_codex(cli.format, cli.color, command),
         Commands::Opencode { command } => run_opencode(cli.format, command),
         Commands::Doctor => run_doctor(cli.format),
         Commands::Completion { shell } => {
@@ -284,7 +302,7 @@ fn require_confirmation(yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_codex(format: OutputFormat, command: CodexCommands) -> Result<()> {
+fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> Result<()> {
     let store = ProfileStore::from_env().context("failed to open Codex profile storage")?;
     match command {
         CodexCommands::Profiles => {
@@ -325,10 +343,21 @@ fn run_codex(format: OutputFormat, command: CodexCommands) -> Result<()> {
                 store.set_default(&name)?;
             }
         }
-        CodexCommands::Usage { profile } => {
-            let profile = store.resolve(profile.as_deref())?;
-            let snapshot = fetch(&profile)?;
-            output_snapshot(format, &snapshot)?;
+        CodexCommands::Usage {
+            profile,
+            allow_private_api,
+        } => {
+            if let Some(name) = profile.as_deref() {
+                store.resolve(Some(name))?;
+            }
+            let results = fetch_all(&store, allow_private_api)?;
+            output_codex_dashboard(
+                format,
+                &results,
+                profile.as_deref(),
+                color,
+                allow_private_api,
+            )?;
         }
         CodexCommands::Credits {
             profile,
@@ -401,19 +430,9 @@ fn run_codex(format: OutputFormat, command: CodexCommands) -> Result<()> {
                 }
             }
         }
-        CodexCommands::All => {
-            let results = fetch_all(&store)?;
-            if matches!(format, OutputFormat::Json) {
-                output_value(format, &results)?;
-            } else {
-                for result in results {
-                    if let Some(snapshot) = result.snapshot {
-                        output_snapshot(format, &snapshot)?;
-                    } else {
-                        eprintln!("{}: {}", result.profile, result.error.unwrap_or_default());
-                    }
-                }
-            }
+        CodexCommands::All { allow_private_api } => {
+            let results = fetch_all(&store, allow_private_api)?;
+            output_codex_dashboard(format, &results, None, color, allow_private_api)?;
         }
         CodexCommands::Run { profile, args } => {
             let profile = store.resolve(profile.as_deref())?;
@@ -433,27 +452,50 @@ fn run_codex(format: OutputFormat, command: CodexCommands) -> Result<()> {
     Ok(())
 }
 
-fn fetch_all(store: &ProfileStore) -> Result<Vec<ProfileResult>> {
+fn fetch_all(store: &ProfileStore, allow_private_api: bool) -> Result<Vec<ProfileResult>> {
     Ok(store
         .list()?
         .into_iter()
-        .map(|profile| match fetch(&profile) {
-            Ok(snapshot) => ProfileResult {
-                profile: profile.name,
+        .map(|profile| fetch_profile(&profile, allow_private_api))
+        .collect())
+}
+
+fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
+    if !profile.authenticated {
+        return ProfileResult {
+            profile: profile.name.clone(),
+            authenticated: false,
+            snapshot: None,
+            error: None,
+        };
+    }
+
+    match fetch(profile) {
+        Ok(mut snapshot) => {
+            if allow_private_api && snapshot.reset_credits.credits.is_none() {
+                if let Ok(credits) = detailed_credits(profile, &snapshot, true) {
+                    snapshot.reset_credits = credits;
+                }
+            }
+            ProfileResult {
+                profile: profile.name.clone(),
+                authenticated: true,
                 snapshot: Some(snapshot),
                 error: None,
-            },
-            Err(error) => ProfileResult {
-                profile: profile.name,
-                snapshot: None,
-                error: Some(error.to_string()),
-            },
-        })
-        .collect())
+            }
+        }
+        Err(error) => ProfileResult {
+            profile: profile.name.clone(),
+            authenticated: true,
+            snapshot: None,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 fn run_overview(
     format: OutputFormat,
+    color: ColorMode,
     days: u32,
     all_projects: bool,
     project: Option<PathBuf>,
@@ -464,10 +506,11 @@ fn run_overview(
         .context("failed to read OpenCode usage")?;
     let codex = ProfileStore::from_env()
         .map_err(anyhow::Error::from)
-        .and_then(|store| fetch_all(&store))
+        .and_then(|store| fetch_all(&store, false))
         .unwrap_or_else(|error| {
             vec![ProfileResult {
                 profile: "codex".to_owned(),
+                authenticated: false,
                 snapshot: None,
                 error: Some(error.to_string()),
             }]
@@ -476,13 +519,7 @@ fn run_overview(
         output_value(format, &json!({"opencode": report, "codex": codex}))
     } else {
         println!("CODEX");
-        for result in codex {
-            if let Some(snapshot) = result.snapshot {
-                output_snapshot(format, &snapshot)?;
-            } else {
-                eprintln!("{}: {}", result.profile, result.error.unwrap_or_default());
-            }
-        }
+        output_codex_dashboard(OutputFormat::Terminal, &codex, None, color, false)?;
         println!("\nOPENCODE");
         output_usage(format, &report, false, 10)
     }
@@ -604,39 +641,392 @@ fn output_usage(
     Ok(())
 }
 
-fn output_snapshot(format: OutputFormat, snapshot: &Snapshot) -> Result<()> {
-    if matches!(format, OutputFormat::Json) {
-        return output_value(format, snapshot);
+struct Theme {
+    enabled: bool,
+}
+
+impl Theme {
+    fn new(mode: ColorMode) -> Self {
+        let enabled = match mode {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => {
+                std::io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none()
+                    && std::env::var("TERM").as_deref() != Ok("dumb")
+            }
+        };
+        Self { enabled }
     }
+
+    fn paint(&self, text: impl AsRef<str>, code: &str) -> String {
+        let text = text.as_ref();
+        if self.enabled {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+}
+
+const BOLD: &str = "1";
+const DIM: &str = "2";
+const RED: &str = "31";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const CYAN: &str = "36";
+
+fn output_codex_dashboard(
+    format: OutputFormat,
+    results: &[ProfileResult],
+    selected: Option<&str>,
+    color: ColorMode,
+    allow_private_api: bool,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(
+            format,
+            &json!({
+                "account_count": results.len(),
+                "selected_profile": selected,
+                "accounts": results,
+            }),
+        );
+    }
+
+    let theme = Theme::new(color);
+    let ready = results
+        .iter()
+        .filter(|result| result.snapshot.is_some())
+        .count();
+    println!();
     println!(
-        "{}  {}  {}",
-        snapshot.profile,
+        "{}",
+        theme.paint(
+            "╭─ CODEX USAGE DASHBOARD ─────────────────────────────╮",
+            BOLD
+        )
+    );
+    println!(
+        "{}",
+        theme.paint(
+            format!(
+                "│ Accounts: {} total · {} ready · {} │",
+                results.len(),
+                ready,
+                selected
+                    .map(|name| format!("selected: {name}"))
+                    .unwrap_or_else(|| "all accounts".to_owned())
+            ),
+            CYAN,
+        )
+    );
+    println!(
+        "{}",
+        theme.paint(
+            "╰──────────────────────────────────────────────────────╯",
+            BOLD
+        )
+    );
+    println!();
+    println!("{}", theme.paint("ACCOUNT OVERVIEW", BOLD));
+    println!("  PROFILE       STATUS       USAGE       RESET              CREDITS");
+    for result in results {
+        render_account_summary(&theme, result, selected);
+    }
+
+    println!();
+    println!("{}", theme.paint("ACCOUNT DETAILS", BOLD));
+    if results.is_empty() {
+        println!("  No Codex accounts found. Run `ai-monitor codex login NAME`.");
+    }
+    for result in results {
+        render_account_card(&theme, result, selected, allow_private_api);
+    }
+
+    if !allow_private_api && results.iter().any(missing_credit_details) {
+        println!();
+        println!(
+            "{}",
+            theme.paint(
+                "Note: some reset-credit expiry dates are unavailable. Use --allow-private-api only if you accept the private endpoint risk.",
+                YELLOW,
+            )
+        );
+    }
+    Ok(())
+}
+
+fn render_account_summary(theme: &Theme, result: &ProfileResult, selected: Option<&str>) {
+    let marker = if selected == Some(result.profile.as_str()) {
+        ">"
+    } else {
+        " "
+    };
+    let name = truncate(&result.profile, 12);
+    let Some(snapshot) = &result.snapshot else {
+        let status = if result.authenticated {
+            theme.paint("[ERROR]", RED)
+        } else {
+            theme.paint("[LOGIN]", YELLOW)
+        };
+        println!(
+            "  {marker} {name:<12} {status:<12} {:<10} {:<18} not ready",
+            "-", "-"
+        );
+        return;
+    };
+
+    let status = theme.paint("[READY]", GREEN);
+    let (usage, usage_code) = primary_usage(snapshot);
+    let usage_text = theme.paint(format!("{usage:>5.1}%"), usage_code);
+    let reset = primary_limit(snapshot)
+        .and_then(|limit| limit.resets_at)
+        .map(format_reset_summary)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let credits = format_credit_count(theme, &snapshot.reset_credits);
+    println!(
+        "  {marker} {name:<12} {status:<12} {usage_text:<10} {:<18} {}",
+        reset, credits
+    );
+}
+
+fn render_account_card(
+    theme: &Theme,
+    result: &ProfileResult,
+    selected: Option<&str>,
+    allow_private_api: bool,
+) {
+    let selected_marker = if selected == Some(result.profile.as_str()) {
+        " <selected>"
+    } else {
+        ""
+    };
+    println!();
+    println!(
+        "  {}",
+        theme.paint(
+            format!(
+                "┌─ {}{} ─────────────────────────────────────────────",
+                result.profile, selected_marker
+            ),
+            CYAN,
+        )
+    );
+
+    let Some(snapshot) = &result.snapshot else {
+        let message = if result.authenticated {
+            result
+                .error
+                .as_deref()
+                .unwrap_or("Codex app-server unavailable")
+        } else {
+            "Not logged in"
+        };
+        println!("  │ {}", theme.paint(message, YELLOW));
+        println!("  └──────────────────────────────────────────────────");
+        return;
+    };
+
+    let account = format!(
+        "{} · {}",
         snapshot.account.email.as_deref().unwrap_or("unknown"),
         snapshot.account.plan_type.as_deref().unwrap_or("unknown")
     );
+    println!("  │ Account: {}", truncate(&account, 64));
+    println!("  │");
+    println!("  │ {}", theme.paint("RATE LIMITS", BOLD));
+    if snapshot.limits.is_empty() {
+        println!("  │   No rate-limit window returned by Codex.");
+    }
     for limit in &snapshot.limits {
+        let (usage, usage_code) = limit_usage(limit);
+        let bar = theme.paint(progress_bar(usage, 24), usage_code);
+        let percentage = theme.paint(format!("{usage:>5.1}%"), usage_code);
+        let reset = limit
+            .resets_at
+            .map(format_reset_time)
+            .unwrap_or_else(|| "unknown".to_owned());
         println!(
-            "  {:<9} {:>6.1}%  resets {}",
+            "  │   {:<9} {} {}  reset {}",
             limit_label(limit),
-            limit.used_percent,
-            limit
-                .resets_at
-                .map(|time| time
-                    .with_timezone(&chrono::Local)
-                    .format("%Y-%m-%d %H:%M")
-                    .to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
+            bar,
+            percentage,
+            reset
         );
     }
+    println!("  │");
+    println!("  │ {}", theme.paint("RESET CREDITS", BOLD));
     println!(
-        "  reset credits: {}",
-        snapshot
-            .reset_credits
-            .available_count
-            .map(|count| count.to_string())
-            .unwrap_or_else(|| "unknown".to_owned())
+        "  │   Available: {}  Source: {}",
+        format_credit_count(theme, &snapshot.reset_credits),
+        snapshot.reset_credits.source
     );
-    Ok(())
+    render_credit_details(theme, &snapshot.reset_credits, allow_private_api);
+    if let Some(error) = &snapshot.usage_error {
+        println!("  │   Usage activity: {}", theme.paint(error, DIM));
+    }
+    println!("  └──────────────────────────────────────────────────");
+}
+
+fn render_credit_details(theme: &Theme, credits: &ResetCredits, allow_private_api: bool) {
+    match credits.credits.as_deref() {
+        Some(rows) => {
+            if rows.is_empty() {
+                if credits.available_count.unwrap_or(0) > 0 {
+                    println!(
+                        "  │   {}",
+                        theme.paint("Expiry details unavailable from app-server", YELLOW)
+                    );
+                } else {
+                    println!("  │   No reset credits currently available.");
+                }
+            } else {
+                for (index, credit) in rows.iter().enumerate() {
+                    render_credit(theme, index + 1, credit);
+                }
+            }
+        }
+        None => {
+            let hint = if allow_private_api {
+                "Private credit detail lookup failed or returned no rows"
+            } else {
+                "Expiry details require --allow-private-api"
+            };
+            println!("  │   {}", theme.paint(hint, YELLOW));
+        }
+    }
+}
+
+fn render_credit(theme: &Theme, index: usize, credit: &ResetCredit) {
+    let status = credit.status.as_deref().unwrap_or("available");
+    let status_code = if matches!(status, "active" | "available") {
+        GREEN
+    } else {
+        DIM
+    };
+    let title = truncate(credit.title.as_deref().unwrap_or("Reset credit"), 24);
+    let expires = credit
+        .expires_at
+        .map(|time| {
+            let label = format!(
+                "{} ({})",
+                time.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+                relative_time(time)
+            );
+            theme.paint(label, expiry_color(time))
+        })
+        .unwrap_or_else(|| "no expiry".to_owned());
+    println!(
+        "  │   #{index:<2} {}  {:<24} expires {}",
+        theme.paint(status, status_code),
+        title,
+        expires
+    );
+}
+
+fn missing_credit_details(result: &ProfileResult) -> bool {
+    result
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.reset_credits.credits.is_none())
+}
+
+fn primary_limit(snapshot: &Snapshot) -> Option<&LimitWindow> {
+    snapshot
+        .limits
+        .iter()
+        .find(|limit| limit.name == "primary")
+        .or_else(|| snapshot.limits.first())
+}
+
+fn primary_usage(snapshot: &Snapshot) -> (f64, &'static str) {
+    primary_limit(snapshot)
+        .map(limit_usage)
+        .unwrap_or((0.0, DIM))
+}
+
+fn limit_usage(limit: &LimitWindow) -> (f64, &'static str) {
+    let usage = limit.used_percent.clamp(0.0, 100.0);
+    let color = if usage >= 90.0 {
+        RED
+    } else if usage >= 75.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+    (usage, color)
+}
+
+fn format_credit_count(theme: &Theme, credits: &ResetCredits) -> String {
+    match credits.available_count {
+        Some(0) => theme.paint("0 available", DIM),
+        Some(count) => theme.paint(format!("{count} available"), GREEN),
+        None => theme.paint("unknown", YELLOW),
+    }
+}
+
+fn progress_bar(value: f64, width: usize) -> String {
+    let filled = ((value.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn format_reset_time(time: DateTime<Utc>) -> String {
+    format!(
+        "{} ({})",
+        time.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+        relative_time(time)
+    )
+}
+
+fn format_reset_summary(time: DateTime<Utc>) -> String {
+    format!(
+        "{} ({})",
+        time.with_timezone(&Local).format("%m-%d %H:%M"),
+        short_relative_time(time)
+    )
+}
+
+fn relative_time(time: DateTime<Utc>) -> String {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "now".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("in {hours}h {minutes}m")
+    } else {
+        format!("in {minutes}m")
+    }
+}
+
+fn short_relative_time(time: DateTime<Utc>) -> String {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "now".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else {
+        format!("{}h", hours.max(1))
+    }
+}
+
+fn expiry_color(time: DateTime<Utc>) -> &'static str {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 172_800 {
+        RED
+    } else if seconds <= 604_800 {
+        YELLOW
+    } else {
+        GREEN
+    }
 }
 
 fn limit_label(limit: &ai_monitor::codex::LimitWindow) -> String {

@@ -32,3 +32,13 @@ fn generates_shell_completion() {
         .success()
         .stdout(predicate::str::contains("#compdef ai-monitor"));
 }
+
+#[test]
+fn codex_usage_help_exposes_dashboard_options() {
+    Command::cargo_bin("ai-monitor")
+        .unwrap()
+        .args(["codex", "usage", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--allow-private-api"));
+}
