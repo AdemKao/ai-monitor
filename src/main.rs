@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::io::IsTerminal;
 use std::ops::AddAssign;
 use std::path::PathBuf;
@@ -86,8 +87,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Generate shell completion scripts.
-    Completion { shell: Shell },
+    /// Generate or install shell completion scripts.
+    Completion {
+        shell: Shell,
+        /// Install the completion file into the user's shell completion directory.
+        #[arg(long)]
+        install: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -220,7 +226,10 @@ fn run() -> Result<()> {
         Commands::Opencode { command } => run_opencode(cli.format, command),
         Commands::Doctor => run_doctor(cli.format),
         Commands::Update { check, yes, force } => run_update(cli.format, check, yes, force),
-        Commands::Completion { shell } => {
+        Commands::Completion { shell, install } => {
+            if install {
+                return install_completion(shell);
+            }
             generate(
                 shell,
                 &mut Cli::command(),
@@ -230,6 +239,102 @@ fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn install_completion(shell: Shell) -> Result<()> {
+    let (directory, filename) = completion_destination(shell)?;
+    fs::create_dir_all(&directory).context("could not create completion directory")?;
+    let path = directory.join(filename);
+    let mut script = Vec::new();
+    generate(shell, &mut Cli::command(), "ai-monitor", &mut script);
+    atomic_write(&path, &script).context("could not install completion script")?;
+
+    let backup = if matches!(shell, Shell::Zsh) {
+        ensure_zsh_completion_path()?
+    } else {
+        None
+    };
+    println!("Installed {shell:?} completion: {}", path.display());
+    if let Some(backup) = backup {
+        println!("Backed up shell configuration: {}", backup.display());
+    }
+    println!("Restart the shell or run `rehash` to activate completion.");
+    Ok(())
+}
+
+fn completion_destination(shell: Shell) -> Result<(PathBuf, String)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let xdg_data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    Ok(match shell {
+        Shell::Zsh => (home.join(".zsh/completions"), "_ai-monitor".to_owned()),
+        Shell::Bash => (
+            xdg_data.join("bash-completion/completions"),
+            "ai-monitor".to_owned(),
+        ),
+        Shell::Fish => (
+            xdg_config.join("fish/completions"),
+            "ai-monitor.fish".to_owned(),
+        ),
+        Shell::PowerShell => (
+            home.join("Documents/PowerShell/Completions"),
+            "ai-monitor.ps1".to_owned(),
+        ),
+        Shell::Elvish => (xdg_config.join("elvish/lib"), "ai-monitor.elv".to_owned()),
+        _ => bail!("completion installation is not supported for this shell"),
+    })
+}
+
+fn ensure_zsh_completion_path() -> Result<Option<PathBuf>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let path = home.join(".zshrc");
+    let mut contents = if path.exists() {
+        fs::read_to_string(&path).context("could not read .zshrc")?
+    } else {
+        String::new()
+    };
+    let completion_path = "fpath=(\"$HOME/.zsh/completions\" $fpath)";
+    let needs_fpath = !contents.contains(completion_path);
+    let needs_compinit = !contents.contains("compinit");
+    if !needs_fpath && !needs_compinit {
+        return Ok(None);
+    }
+
+    let backup = if path.exists() {
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+        let backup = home.join(format!(".zshrc.backup-{timestamp}"));
+        fs::copy(&path, &backup).context("could not back up .zshrc")?;
+        Some(backup)
+    } else {
+        None
+    };
+    if !contents.ends_with('\n') && !contents.is_empty() {
+        contents.push('\n');
+    }
+    contents.push_str("\n# ai-monitor shell completion\n");
+    if needs_fpath {
+        contents.push_str(completion_path);
+        contents.push('\n');
+    }
+    if needs_compinit {
+        contents.push_str("autoload -Uz compinit\ncompinit\n");
+    }
+    atomic_write(&path, contents.as_bytes()).context("could not update .zshrc")?;
+    Ok(backup)
+}
+
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)
 }
 
 fn run_update(format: OutputFormat, check_only: bool, yes: bool, force: bool) -> Result<()> {
@@ -433,7 +538,7 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
             if let Some(name) = profile.as_deref() {
                 store.resolve(Some(name))?;
             }
-            let results = fetch_all(&store, allow_private_api)?;
+            let results = fetch_all(&store, allow_private_api, profile.as_deref())?;
             output_codex_dashboard(
                 format,
                 &results,
@@ -514,7 +619,7 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
             }
         }
         CodexCommands::All { allow_private_api } => {
-            let results = fetch_all(&store, allow_private_api)?;
+            let results = fetch_all(&store, allow_private_api, None)?;
             output_codex_dashboard(format, &results, None, color, allow_private_api)?;
         }
         CodexCommands::Run { profile, args } => {
@@ -535,11 +640,21 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
     Ok(())
 }
 
-fn fetch_all(store: &ProfileStore, allow_private_api: bool) -> Result<Vec<ProfileResult>> {
+fn fetch_all(
+    store: &ProfileStore,
+    allow_private_api: bool,
+    private_profile: Option<&str>,
+) -> Result<Vec<ProfileResult>> {
     Ok(store
         .list()?
         .into_iter()
-        .map(|profile| fetch_profile(&profile, allow_private_api))
+        .map(|profile| {
+            let allow_private_for_profile = allow_private_api
+                && private_profile
+                    .map(|selected| selected == profile.name)
+                    .unwrap_or(true);
+            fetch_profile(&profile, allow_private_for_profile)
+        })
         .collect())
 }
 
@@ -594,7 +709,7 @@ fn run_overview(
         .context("failed to read OpenCode usage")?;
     let codex = ProfileStore::from_env()
         .map_err(anyhow::Error::from)
-        .and_then(|store| fetch_all(&store, false))
+        .and_then(|store| fetch_all(&store, false, None))
         .unwrap_or_else(|error| {
             vec![ProfileResult {
                 profile: "codex".to_owned(),

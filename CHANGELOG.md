@@ -2,6 +2,12 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.3.1] - 2026-08-11
+
+- `--allow-private-api` 指定 profile 時只對 selected profile 執行 private fallback，避免 dashboard 摘要造成不必要的多帳號請求。
+- private credit lookup 遇到 HTTP 429 時保留 retry-after 資訊，且不會自動密集重試。
+- `completion <shell> --install` 可安裝 completion script；zsh 會在需要時備份並更新 `.zshrc` 的 completion path。
+
 ## [0.3.0] - 2026-08-11
 
 - 新增 `update`、`update --check`、`update --yes` 與 `update --force`，直接從 GitHub Release 驗證 checksum 後更新 binary。
@@ -29,3 +35,4 @@
 [0.1.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.1.0
 [0.2.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.2.0
 [0.3.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.0
+[0.3.1]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.1

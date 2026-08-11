@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.3.0`  
+目前版本：`v0.3.1`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
@@ -15,6 +15,7 @@ Repository：<https://github.com/AdemKao/ai-monitor>
 - `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
 - `update` 直接從 GitHub Release 檢查、驗證 checksum 並更新目前的 `ai-monitor` binary，不需要 local checkout。
+- `completion <shell> --install` 可把 shell completion 安裝到使用者目錄，支援 `ai-monitor o<Tab>`、`ai-monitor op<Tab>` 等 command completion。
 - 所有資料型命令支援 terminal 或 pretty JSON 輸出；另有 `doctor` 與 shell `completion`。
 - 兼容以 `chatgpt-status` 與 `opencode-daily-usage` 作為 executable basename 的 legacy alias，但不承諾完整舊 CLI flag 相容。
 
@@ -66,7 +67,7 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 從指定 Git tag 安裝（開發者用途）：
 
 ```sh
-cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.3.0 ai-monitor
+cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.3.1 ai-monitor
 ```
 
 在本機 checkout 安裝目前原始碼：
@@ -171,7 +172,9 @@ ai-monitor codex credits --profile work --allow-private-api
 ai-monitor codex expiring --profile work --days 7 --allow-private-api
 ```
 
-這個 fallback 會讀取該 profile 的 `auth.json`，以 bearer token 直接請求 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。這是 ChatGPT/Codex 的 private、非官方公開 API，不保證穩定或允許第三方使用；它可能傳送帳號 token 到該 endpoint。除非你理解風險，請不要使用 `--allow-private-api`。
+這個 fallback 會讀取該 profile 的 `auth.json`，以 bearer token 直接請求 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`。每個 eligible profile 每次 command 最多請求一次；指定 `--profile` 時只會對 selected profile 執行 private fallback。這是 ChatGPT/Codex 的 private、非官方公開 API，不保證穩定或允許第三方使用；它可能傳送帳號 token 到該 endpoint。除非你理解風險，請不要使用 `--allow-private-api`。
+
+若 endpoint 回傳 HTTP 429，代表服務端 rate limit，不代表本機 auth 解析失敗。ai-monitor 不會自動密集 retry，請等待後再試。
 
 ### 5. 查看 OpenCode usage
 
@@ -223,6 +226,15 @@ ai-monitor completion zsh > "${fpath[1]}/_ai-monitor"
 ai-monitor completion bash > ~/.local/share/bash-completion/completions/ai-monitor
 ```
 
+最簡單的 zsh 一次性設定：
+
+```sh
+ai-monitor completion zsh --install
+rehash
+```
+
+它會安裝 `~/.zsh/completions/_ai-monitor`，必要時備份並更新 `.zshrc` 的 `fpath`。一般 binary installer 不會暗自修改 shell 設定；完成這次設定後，之後的 `ai-monitor update` 不需要重新設定 completion。
+
 其餘 Codex 操作：
 
 ```sh
@@ -249,7 +261,7 @@ ai-monitor codex logout --profile work
 | `opencode` | 見下表 | OpenCode usage 與 optional index |
 | `doctor` | 無 | 檢查 binary 與本機 storage path |
 | `update` | `--check`；`--yes`；`--force` | 從 GitHub latest Release 驗證並更新目前 binary |
-| `completion <SHELL>` | `bash`、`elvish`、`fish`、`powershell`、`zsh` | 輸出 completion script |
+| `completion <SHELL>` | `bash`、`elvish`、`fish`、`powershell`、`zsh`；`--install` | 輸出或安裝 completion script |
 
 ### Codex commands
 

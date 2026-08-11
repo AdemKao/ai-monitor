@@ -53,8 +53,8 @@ pub enum Error {
     Rpc,
     #[error("private credit lookup failed")]
     PrivateCredits,
-    #[error("private credit lookup was rate limited")]
-    PrivateCreditsRateLimited,
+    #[error("private credit lookup was rate limited; retry after {retry_after_seconds:?} seconds")]
+    PrivateCreditsRateLimited { retry_after_seconds: Option<u64> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -562,7 +562,10 @@ pub fn detailed_credits(
     snapshot: &Snapshot,
     allow_private: bool,
 ) -> Result<ResetCredits> {
-    if snapshot.reset_credits.credits.is_some() || !allow_private {
+    if snapshot.reset_credits.credits.is_some()
+        || !allow_private
+        || snapshot.reset_credits.available_count == Some(0)
+    {
         return Ok(snapshot.reset_credits.clone());
     }
     fetch_private_credits(profile)
@@ -592,7 +595,14 @@ fn fetch_private_credits(profile: &Profile) -> Result<ResetCredits> {
     }
     let response = request.send().map_err(|_| Error::PrivateCredits)?;
     if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(Error::PrivateCreditsRateLimited);
+        let retry_after_seconds = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        return Err(Error::PrivateCreditsRateLimited {
+            retry_after_seconds,
+        });
     }
     if !response.status().is_success() {
         return Err(Error::PrivateCredits);
