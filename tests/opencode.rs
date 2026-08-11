@@ -33,7 +33,9 @@ impl Fixture {
                 CREATE TABLE session (
                     id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
-                    directory TEXT NOT NULL
+                    directory TEXT NOT NULL,
+                    parent_id TEXT,
+                    agent TEXT
                 );
                 CREATE TABLE message (
                     id TEXT PRIMARY KEY,
@@ -64,6 +66,23 @@ impl Fixture {
             .execute(
                 "INSERT INTO session (id, project_id, directory) VALUES (?1, ?2, ?3)",
                 params![id, project_id, directory.to_string_lossy()],
+            )
+            .expect("session row");
+    }
+
+    fn add_session_with_agent(
+        &self,
+        id: &str,
+        project_id: &str,
+        directory: &Path,
+        parent_id: Option<&str>,
+        agent: &str,
+    ) {
+        let connection = Connection::open(&self.db_path).expect("temporary database");
+        connection
+            .execute(
+                "INSERT INTO session (id, project_id, directory, parent_id, agent) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, project_id, directory.to_string_lossy(), parent_id, agent],
             )
             .expect("session row");
     }
@@ -113,6 +132,62 @@ fn current_message(input: u64, output: u64, cost: f64) -> serde_json::Value {
             "cache": { "read": 4, "write": 5 }
         }
     })
+}
+
+fn agent_message(agent: &str, input: u64, output: u64) -> serde_json::Value {
+    json!({
+        "role": "assistant",
+        "providerID": "openai",
+        "modelID": "gpt-5",
+        "agent": agent,
+        "cost": 0.0,
+        "tokens": {
+            "input": input,
+            "output": output,
+            "reasoning": 0,
+            "cache": { "read": 0, "write": 0 }
+        }
+    })
+}
+
+#[test]
+fn dashboard_aggregates_projects_agents_and_subagents() {
+    let fixture = Fixture::new();
+    fixture.add_session_with_agent("s1", "project-a", &fixture.repo, None, "build");
+    fixture.add_session_with_agent("s2", "project-a", &fixture.nested, Some("s1"), "general");
+    fixture.add_session("s3", "project-b", &fixture.other);
+
+    fixture.add_message("m1", "s1", 0, agent_message("build", 10, 20));
+    fixture.add_message("m2", "s2", 0, agent_message("general", 5, 7));
+    fixture.add_message("m3", "s3", 0, agent_message("ignored", 100, 100));
+
+    let report = fixture
+        .provider()
+        .dashboard(2, false, Some(&fixture.repo))
+        .expect("dashboard report");
+
+    assert_eq!(report.projects.len(), 1);
+    assert_eq!(report.totals.calls, 2);
+    assert_eq!(report.totals.sessions, 2);
+    assert_eq!(report.projects[0].name, "repo");
+
+    let build = report.projects[0]
+        .agents
+        .iter()
+        .find(|agent| agent.name == "build")
+        .expect("build agent");
+    assert_eq!(build.kind, "agent");
+    assert_eq!(build.usage.calls, 1);
+    assert_eq!(build.usage.active_tokens(), 30);
+
+    let general = report.projects[0]
+        .agents
+        .iter()
+        .find(|agent| agent.name == "general")
+        .expect("general subagent");
+    assert_eq!(general.kind, "subagent");
+    assert_eq!(general.usage.calls, 1);
+    assert_eq!(general.usage.active_tokens(), 12);
 }
 
 #[test]

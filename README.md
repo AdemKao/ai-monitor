@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.3.5`  
+目前版本：`v0.4.0`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
@@ -13,6 +13,7 @@ Repository：<https://github.com/AdemKao/ai-monitor>
 - terminal dashboard 會以進度條與顏色標示高用量、即將到期與已過期項目；可用 `--color always|never` 控制顏色。
 - `codex credits`、`codex expiring`、`codex usage` 與 `codex all` 預設會查詢 reset credits；可用 `--no-private-api` 停用 private endpoint fallback。
 - `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
+- `opencode dashboard` 以 project → agent／subagent 彙總 token、model call 次數、session 數與比例，支援 terminal 與 JSON。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
 - `update` 直接從 GitHub Release 檢查、驗證 checksum 並更新目前的 `ai-monitor` binary，不需要 local checkout。
 - `completion <shell> --install` 可把 shell completion 安裝到使用者目錄，支援 `ai-monitor o<Tab>`、`ai-monitor op<Tab>` 等 command completion。
@@ -189,7 +190,19 @@ ai-monitor opencode usage --all-projects --include-cache
 
 OpenCode usage 以 SQLite read-only mode 開啟 database，不會建立 index、不會更新 message，也不會執行 optimize。`--all-projects` 未安裝 index 時會提出可能掃描整個 database 的警告。
 
-### 6. 管理 OpenCode optional index
+### 6. 查看 OpenCode project／agent dashboard
+
+```sh
+ai-monitor opencode dashboard
+ai-monitor opencode dashboard --all-projects --days 30
+ai-monitor opencode dashboard --project "$PWD" --top-agents 0
+```
+
+dashboard 預設顯示目前 project 最近 7 天的 calls、sessions、active tokens 與 agent／subagent breakdown。`--all-projects` 顯示 project overview 與各 project 的 agent breakdown；terminal 預設顯示 top 10 projects／agents，使用 `--top-projects 0 --top-agents 0` 顯示全部。`--include-cache` 將 cache read／write tokens 納入顯示 token 數；JSON 會保留完整 breakdown。call count 是 assistant model responses，`compaction` 維護訊息不計入 CTA dashboard。
+
+dashboard 只掃描指定日期範圍的 `message` 與必要的 `session` metadata，不讀取大型 `part` content。all-project 查詢若未建立 optional time index，可能掃描整張 message table；可在確認會修改第三方 database 後執行 `ai-monitor opencode optimize create --yes`。
+
+### 7. 管理 OpenCode optional index
 
 ```sh
 ai-monitor opencode optimize status
@@ -205,7 +218,7 @@ ai-monitor opencode optimize --db "$HOME/.local/share/opencode/opencode.db" stat
 
 `status` 是唯讀檢查。`create --yes` 與 `remove --yes` 會直接修改第三方 OpenCode database；沒有 `--yes` 時 command 會失敗並要求重新執行確認。執行前請自行備份。建立的 index 名稱是 `ai_monitor_message_time_created_idx`，只索引 `message.time_created`；`remove` 只會移除這個 `ai-monitor` index，不會刪除 OpenCode message 或 session。
 
-### 7. 使用 JSON、completion 與其他 command
+### 8. 使用 JSON、completion 與其他 command
 
 `--format` 是 global option，預設是 `terminal`，可放在 command 前：
 
@@ -214,6 +227,7 @@ ai-monitor --format json overview
 ai-monitor --format json codex profiles
 ai-monitor --format json codex credits --profile work
 ai-monitor --format json opencode usage --all-projects
+ai-monitor --format json opencode dashboard --all-projects
 ai-monitor --format json opencode optimize status
 ai-monitor --format json doctor
 ```
@@ -259,7 +273,7 @@ ai-monitor codex logout --profile work
 | --- | --- | --- |
 | `overview` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--no-private-api` | 合併 Codex limits 與 OpenCode usage |
 | `codex` | 見下表 | Codex profile、帳號與 limits |
-| `opencode` | 見下表 | OpenCode usage 與 optional index |
+| `opencode` | 見下表 | OpenCode usage、project dashboard 與 optional index |
 | `doctor` | 無 | 檢查 binary 與本機 storage path |
 | `update` | `--check`；`--yes`；`--force` | 從 GitHub latest Release 驗證並更新目前 binary |
 | `completion <SHELL>` | `bash`、`elvish`、`fish`、`powershell`、`zsh`；`--install` | 輸出或安裝 completion script |
@@ -285,11 +299,12 @@ ai-monitor codex logout --profile work
 | Command | Options | 行為 |
 | --- | --- | --- |
 | `opencode usage` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-models <N>` 預設 `10` | Read-only usage report；省略 project 時使用目前工作目錄 |
+| `opencode dashboard` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-projects <N>` 預設 `10`；`--top-agents <N>` 預設 `10` | 依 project、agent／subagent 顯示 calls、sessions、tokens 與 share；`0` 代表不限制 |
 | `opencode optimize status` | `--db <PATH>` 位於 `optimize` 前 | Read-only 檢查 `ai-monitor` index 是否存在 |
 | `opencode optimize create` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 建立 `ai_monitor_message_time_created_idx`，直接修改第三方 DB |
 | `opencode optimize remove` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 移除 `ai-monitor` 自己的 index，直接修改第三方 DB |
 
-OpenCode database 必須具備 `session(id, project_id, directory)` 與 `message(session_id, time_created, data)` 欄位。usage 只計算 `role == "assistant"` 的 message；缺少 provider／model 時會使用 `unknown`，無法解析的 timestamp／JSON row 會略過。
+OpenCode database 必須具備 `session(id, project_id, directory)` 與 `message(session_id, time_created, data)` 欄位。usage 與 dashboard 只計算 `role == "assistant"` 的 message；缺少 provider／model 時會使用 `unknown`，無法解析的 timestamp／JSON row 會略過。dashboard 優先使用 `project.worktree`、`message.agent` 與 `session.parent_id`；較舊 schema 缺少 optional 欄位時會使用 session directory 與 agent fallback。
 
 ## Codex profiles 與 legacy 相容策略
 

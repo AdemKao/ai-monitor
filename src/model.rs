@@ -35,6 +35,42 @@ impl AddAssign<&Usage> for Usage {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct BreakdownUsage {
+    pub calls: u64,
+    pub sessions: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cost_usd: f64,
+}
+
+impl BreakdownUsage {
+    pub fn active_tokens(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.reasoning_tokens
+    }
+
+    pub fn all_tokens(&self) -> u64 {
+        self.active_tokens() + self.cache_read_tokens + self.cache_write_tokens
+    }
+
+    pub fn add_usage(&mut self, usage: &Usage) {
+        self.calls = self.calls.saturating_add(usage.messages);
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(usage.reasoning_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
+        self.cost_usd += usage.cost_usd;
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UsageRow {
     pub day: String,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -7,14 +7,16 @@ use chrono::{DateTime, Duration, Local, LocalResult, NaiveDate, TimeZone};
 use directories::BaseDirs;
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Usage, UsageReport, UsageRow};
+use crate::model::{BreakdownUsage, Usage, UsageReport, UsageRow};
 
 pub const INDEX_NAME: &str = "ai_monitor_message_time_created_idx";
 const DB_ENV: &str = "AI_MONITOR_OPENCODE_DB";
 const SOURCE: &str = "opencode";
+const AGENT_PATHS: &[&[&str]] = &[&["agent"]];
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -41,6 +43,32 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardReport {
+    pub source: String,
+    pub start_day: String,
+    pub end_day: String,
+    pub scope: String,
+    pub totals: BreakdownUsage,
+    pub projects: Vec<DashboardProject>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardProject {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub usage: BreakdownUsage,
+    pub agents: Vec<DashboardAgent>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardAgent {
+    pub name: String,
+    pub kind: String,
+    pub usage: BreakdownUsage,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct OpenCodeProvider {
@@ -119,6 +147,70 @@ impl OpenCodeProvider {
             end_day: range.end_day,
             scope,
             rows,
+        })
+    }
+
+    pub fn dashboard(
+        &self,
+        days: u32,
+        all_projects: bool,
+        project: Option<&Path>,
+    ) -> Result<DashboardReport> {
+        let range = DateRange::for_days(days, Local::now())?;
+        let path = discover_db_path(self.explicit_db_path.as_deref())?;
+        let connection = open_database(&path, true)?;
+        validate_schema(&connection)?;
+
+        let (project_id, project_path) = if all_projects {
+            (None, None)
+        } else {
+            let target = project
+                .map(normalize_path)
+                .transpose()
+                .map_err(|_| Error::DatabasePath)?
+                .unwrap_or(
+                    normalize_path(&env::current_dir().map_err(|_| Error::DatabasePath)?)
+                        .map_err(|_| Error::DatabasePath)?,
+                );
+            (resolve_project_id(&connection, &target)?, Some(target))
+        };
+
+        let project_metadata = load_project_metadata(&connection)?;
+        let session_columns = table_columns(&connection, "session")?;
+        let mut totals = DashboardAggregate::default();
+        let mut projects = HashMap::<String, DashboardAggregateProject>::new();
+        stream_dashboard_rows(
+            &connection,
+            &range,
+            project_id.as_deref(),
+            &session_columns,
+            &project_metadata,
+            &mut totals,
+            &mut projects,
+        )?;
+
+        let mut projects = projects
+            .into_iter()
+            .map(|(id, project)| project.finish(id))
+            .collect::<Vec<_>>();
+        let include_path = project_path
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "all-projects".to_owned());
+        projects.sort_by(|left, right| {
+            right
+                .usage
+                .active_tokens()
+                .cmp(&left.usage.active_tokens())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+
+        Ok(DashboardReport {
+            source: SOURCE.to_owned(),
+            start_day: range.start_day,
+            end_day: range.end_day,
+            scope: include_path,
+            totals: totals.finish(),
+            projects,
         })
     }
 
@@ -373,6 +465,258 @@ struct AggregateKey {
     day: String,
     provider: String,
     model: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct DashboardAgentKey {
+    name: String,
+    kind: String,
+}
+
+#[derive(Default)]
+struct DashboardAggregate {
+    usage: BreakdownUsage,
+    sessions: HashSet<String>,
+}
+
+impl DashboardAggregate {
+    fn add_call(&mut self, session_id: &str, usage: &Usage) {
+        self.usage.add_usage(usage);
+        if self.sessions.insert(session_id.to_owned()) {
+            self.usage.sessions = self.usage.sessions.saturating_add(1);
+        }
+    }
+
+    fn finish(self) -> BreakdownUsage {
+        self.usage
+    }
+}
+
+struct DashboardAggregateProject {
+    name: String,
+    path: String,
+    usage: DashboardAggregate,
+    agents: HashMap<DashboardAgentKey, DashboardAggregate>,
+}
+
+impl DashboardAggregateProject {
+    fn new(name: String, path: String) -> Self {
+        Self {
+            name,
+            path,
+            usage: DashboardAggregate::default(),
+            agents: HashMap::new(),
+        }
+    }
+
+    fn finish(self, id: String) -> DashboardProject {
+        let mut agents = self
+            .agents
+            .into_iter()
+            .map(|(key, aggregate)| DashboardAgent {
+                name: key.name,
+                kind: key.kind,
+                usage: aggregate.finish(),
+            })
+            .collect::<Vec<_>>();
+        agents.sort_by(|left, right| {
+            right
+                .usage
+                .active_tokens()
+                .cmp(&left.usage.active_tokens())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        DashboardProject {
+            id,
+            name: self.name,
+            path: self.path,
+            usage: self.usage.finish(),
+            agents,
+        }
+    }
+}
+
+type ProjectMetadata = HashMap<String, (String, String)>;
+
+fn stream_dashboard_rows(
+    connection: &Connection,
+    range: &DateRange,
+    project_id: Option<&str>,
+    session_columns: &HashSet<String>,
+    project_metadata: &ProjectMetadata,
+    totals: &mut DashboardAggregate,
+    projects: &mut HashMap<String, DashboardAggregateProject>,
+) -> Result<()> {
+    let parent_expression = if session_columns.contains("parent_id") {
+        "s.parent_id"
+    } else {
+        "NULL"
+    };
+    let session_agent_expression = if session_columns.contains("agent") {
+        "s.agent"
+    } else {
+        "NULL"
+    };
+    let (query, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match project_id {
+        Some(project_id) => (
+            format!(
+                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression} \
+                 FROM message AS m \
+                 JOIN session AS s ON s.id = m.session_id \
+                 WHERE m.time_created >= ?1 \
+                   AND m.time_created < ?2 \
+                   AND s.project_id = ?3"
+            ),
+            vec![
+                Box::new(range.start_millis),
+                Box::new(range.end_millis),
+                Box::new(project_id.to_owned()),
+            ],
+        ),
+        None => (
+            format!(
+                "SELECT m.session_id, m.data, s.project_id, s.directory, {parent_expression}, {session_agent_expression} \
+                 FROM message AS m \
+                 JOIN session AS s ON s.id = m.session_id \
+                 WHERE m.time_created >= ?1 \
+                   AND m.time_created < ?2"
+            ),
+            vec![Box::new(range.start_millis), Box::new(range.end_millis)],
+        ),
+    };
+
+    let mut statement = connection.prepare(&query).map_err(Error::Query)?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(
+            params.iter().map(|param| param.as_ref()),
+        ))
+        .map_err(Error::Query)?;
+    while let Some(row) = rows.next().map_err(Error::Query)? {
+        let Some(session_id) = text_value(row.get_ref(0).map_err(Error::Query)?) else {
+            continue;
+        };
+        let data = match row.get_ref(1).map_err(Error::Query)? {
+            ValueRef::Text(value) | ValueRef::Blob(value) => value,
+            _ => continue,
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(data) else {
+            continue;
+        };
+        let Some((_, _, usage)) = assistant_usage(&value) else {
+            continue;
+        };
+        let project_id = text_value(row.get_ref(2).map_err(Error::Query)?).unwrap_or_default();
+        let directory = text_value(row.get_ref(3).map_err(Error::Query)?).unwrap_or_default();
+        let parent_id = text_value(row.get_ref(4).map_err(Error::Query)?);
+        let session_agent = text_value(row.get_ref(5).map_err(Error::Query)?);
+        let agent = find_string(&value, AGENT_PATHS)
+            .or(session_agent)
+            .unwrap_or_else(|| "unknown".to_owned());
+        if agent == "compaction" {
+            continue;
+        }
+        let kind = if parent_id.is_some() || agent.starts_with("subagents/") {
+            "subagent"
+        } else {
+            "agent"
+        };
+        let (metadata_name, metadata_path) = project_metadata
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_else(|| (String::new(), directory));
+        let path = if metadata_path.is_empty() {
+            "unknown".to_owned()
+        } else {
+            metadata_path
+        };
+        let name = project_name(&project_id, &path, &metadata_name);
+        let project = projects
+            .entry(project_id.clone())
+            .or_insert_with(|| DashboardAggregateProject::new(name, path));
+        project.usage.add_call(&session_id, &usage);
+        project
+            .agents
+            .entry(DashboardAgentKey {
+                name: agent,
+                kind: kind.to_owned(),
+            })
+            .or_default()
+            .add_call(&session_id, &usage);
+        totals.add_call(&session_id, &usage);
+    }
+    Ok(())
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
+    let query = match table {
+        "project" => "PRAGMA table_info(project)",
+        "session" => "PRAGMA table_info(session)",
+        _ => return Err(Error::InvalidSchema),
+    };
+    let mut statement = connection.prepare(query).map_err(Error::Query)?;
+    let mut rows = statement.query([]).map_err(Error::Query)?;
+    let mut columns = HashSet::new();
+    while let Some(row) = rows.next().map_err(Error::Query)? {
+        columns.insert(row.get::<_, String>(1).map_err(Error::Query)?);
+    }
+    Ok(columns)
+}
+
+fn load_project_metadata(connection: &Connection) -> Result<ProjectMetadata> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(Error::Query)?
+        .is_some();
+    if !exists {
+        return Ok(HashMap::new());
+    }
+
+    let columns = table_columns(connection, "project")?;
+    if !columns.contains("id") || !columns.contains("worktree") {
+        return Ok(HashMap::new());
+    }
+    let name_expression = if columns.contains("name") {
+        "name"
+    } else {
+        "NULL"
+    };
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT id, {name_expression}, worktree FROM project"
+        ))
+        .map_err(Error::Query)?;
+    let mut rows = statement.query([]).map_err(Error::Query)?;
+    let mut metadata = HashMap::new();
+    while let Some(row) = rows.next().map_err(Error::Query)? {
+        let id = row.get::<_, String>(0).map_err(Error::Query)?;
+        let name = row
+            .get::<_, Option<String>>(1)
+            .map_err(Error::Query)?
+            .unwrap_or_default();
+        let path = row.get::<_, String>(2).map_err(Error::Query)?;
+        metadata.insert(id, (name, path));
+    }
+    Ok(metadata)
+}
+
+fn project_name(id: &str, path: &str, name: &str) -> String {
+    if !name.trim().is_empty() {
+        return name.trim().to_owned();
+    }
+    if id == "global" || path == "/" {
+        return "global".to_owned();
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| id.to_owned())
 }
 
 fn stream_usage_rows(

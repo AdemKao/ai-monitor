@@ -41,7 +41,8 @@ fn generates_shell_completion() {
         .assert()
         .success()
         .stdout(predicate::str::contains("#compdef ai-monitor"))
-        .stdout(predicate::str::contains("--no-private-api"));
+        .stdout(predicate::str::contains("--no-private-api"))
+        .stdout(predicate::str::contains("dashboard"));
 }
 
 #[test]
@@ -52,4 +53,16 @@ fn codex_usage_help_exposes_dashboard_options() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--no-private-api"));
+}
+
+#[test]
+fn opencode_dashboard_help_exposes_breakdown_options() {
+    Command::cargo_bin("ai-monitor")
+        .unwrap()
+        .args(["opencode", "dashboard", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all-projects"))
+        .stdout(predicate::str::contains("--top-projects"))
+        .stdout(predicate::str::contains("--top-agents"));
 }

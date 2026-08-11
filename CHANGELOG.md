@@ -2,6 +2,11 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.4.0] - 2026-08-11
+
+- 新增 `opencode dashboard`，依 project、agent／subagent 顯示 calls、sessions、tokens 與 share。
+- dashboard 使用 streaming read-only query，避免讀取 OpenCode 的大型 `part` content；all-project 查詢沿用 optional time index 警告。
+
 ## [0.3.5] - 2026-08-11
 
 - Terminal rate-limit dashboard 只顯示剩餘容量；`used_percent` 仍保留於 JSON 與內部資料。
@@ -57,3 +62,4 @@
 [0.3.3]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.3
 [0.3.4]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.4
 [0.3.5]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.5
+[0.4.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.4.0

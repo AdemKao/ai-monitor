@@ -10,8 +10,8 @@ use ai_monitor::codex::{
     self, LimitWindow, Profile, ProfileStore, ResetCredit, ResetCredits, Snapshot,
     detailed_credits, expiring, fetch,
 };
-use ai_monitor::model::{Usage, UsageReport};
-use ai_monitor::opencode::{OpenCodeProvider, discover_db_path};
+use ai_monitor::model::{BreakdownUsage, Usage, UsageReport};
+use ai_monitor::opencode::{DashboardReport, OpenCodeProvider, discover_db_path};
 use ai_monitor::update;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
@@ -192,6 +192,23 @@ enum OpenCodeCommands {
         include_cache: bool,
         #[arg(long, default_value_t = 10)]
         top_models: usize,
+    },
+    /// Show project, agent, subagent, token, and call-count breakdowns.
+    Dashboard {
+        #[arg(short, long, default_value_t = 7)]
+        days: u32,
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        include_cache: bool,
+        #[arg(long, default_value_t = 10)]
+        top_projects: usize,
+        #[arg(long, default_value_t = 10)]
+        top_agents: usize,
     },
     /// Manage the optional all-project time index.
     Optimize {
@@ -480,6 +497,26 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
                 );
             }
             output_usage(format, &report, include_cache, top_models)
+        }
+        OpenCodeCommands::Dashboard {
+            days,
+            all_projects,
+            project,
+            db,
+            include_cache,
+            top_projects,
+            top_agents,
+        } => {
+            let provider = provider(db);
+            let report = provider
+                .dashboard(days, all_projects, project.as_deref())
+                .context("failed to read OpenCode dashboard")?;
+            if all_projects && !provider.index_status().unwrap_or(false) {
+                eprintln!(
+                    "warning: all-project dashboard queries may scan the entire message table; run `ai-monitor opencode optimize create --yes` to add the optional time index"
+                );
+            }
+            output_dashboard(format, &report, include_cache, top_projects, top_agents)
         }
         OpenCodeCommands::Optimize { action, db } => {
             let provider = provider(db);
@@ -875,6 +912,92 @@ fn output_usage(
         );
     }
     Ok(())
+}
+
+fn output_dashboard(
+    format: OutputFormat,
+    report: &DashboardReport,
+    include_cache: bool,
+    top_projects: usize,
+    top_agents: usize,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(format, report);
+    }
+
+    let total_tokens = dashboard_tokens(&report.totals, include_cache);
+    println!("OPENCODE USAGE DASHBOARD");
+    println!("Range: {} to {}", report.start_day, report.end_day);
+    println!("Scope: {}", report.scope);
+    println!(
+        "Total: {} calls · {} sessions · {} tokens · {} projects",
+        report.totals.calls,
+        report.totals.sessions,
+        compact(total_tokens),
+        report.projects.len()
+    );
+
+    let project_count = limited_count(report.projects.len(), top_projects);
+    println!("\nPROJECT OVERVIEW");
+    println!("PROJECT                         CALLS  SESSIONS      TOKENS   SHARE");
+    for project in report.projects.iter().take(project_count) {
+        let tokens = dashboard_tokens(&project.usage, include_cache);
+        println!(
+            "{:<30} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+            truncate(&project.name, 30),
+            project.usage.calls,
+            project.usage.sessions,
+            compact(tokens),
+            dashboard_share(tokens, total_tokens),
+        );
+    }
+    if project_count < report.projects.len() {
+        println!("Showing top {project_count} projects; use --top-projects 0 for all.");
+    }
+
+    println!("\nAGENT BREAKDOWN");
+    for project in report.projects.iter().take(project_count) {
+        println!("\n{} ({})", project.name, project.path);
+        println!("AGENT / SUBAGENT                 TYPE       CALLS  SESSIONS      TOKENS   SHARE");
+        let agent_count = limited_count(project.agents.len(), top_agents);
+        let project_tokens = dashboard_tokens(&project.usage, include_cache);
+        for agent in project.agents.iter().take(agent_count) {
+            let tokens = dashboard_tokens(&agent.usage, include_cache);
+            println!(
+                "{:<32} {:<9} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+                truncate(&agent.name, 32),
+                agent.kind,
+                agent.usage.calls,
+                agent.usage.sessions,
+                compact(tokens),
+                dashboard_share(tokens, project_tokens),
+            );
+        }
+        if agent_count < project.agents.len() {
+            println!("Showing top {agent_count} agents; use --top-agents 0 for all.");
+        }
+    }
+    Ok(())
+}
+
+fn dashboard_tokens(usage: &BreakdownUsage, include_cache: bool) -> u64 {
+    if include_cache {
+        usage.all_tokens()
+    } else {
+        usage.active_tokens()
+    }
+}
+
+fn dashboard_share(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64 / total as f64 * 100.0
+    }
+}
+
+fn limited_count(total: usize, limit: usize) -> usize {
+    if limit == 0 { total } else { total.min(limit) }
 }
 
 struct Theme {
