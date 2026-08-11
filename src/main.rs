@@ -15,7 +15,7 @@ use ai_monitor::opencode::{OpenCodeProvider, discover_db_path};
 use ai_monitor::update;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use serde::Serialize;
 use serde_json::json;
@@ -24,9 +24,17 @@ use serde_json::json;
 #[command(
     name = "ai-monitor",
     version,
+    disable_version_flag = true,
     about = "Unified local usage monitor for AI coding tools"
 )]
 struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    version: Option<bool>,
     #[arg(long, value_enum, default_value_t, global = true)]
     format: OutputFormat,
     #[arg(long, value_enum, default_value_t, global = true)]

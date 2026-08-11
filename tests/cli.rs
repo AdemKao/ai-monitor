@@ -14,6 +14,16 @@ fn help_exposes_provider_commands() {
 }
 
 #[test]
+fn lowercase_version_flag_prints_version() {
+    Command::cargo_bin("ai-monitor")
+        .unwrap()
+        .arg("-v")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("ai-monitor "));
+}
+
+#[test]
 fn optimize_requires_explicit_confirmation() {
     Command::cargo_bin("ai-monitor")
         .unwrap()

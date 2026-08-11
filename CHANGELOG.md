@@ -2,6 +2,10 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.3.3] - 2026-08-11
+
+- 將版本短參數從 `-V` 改為 `-v`，同時保留 `--version`。
+
 ## [0.3.2] - 2026-08-11
 
 - Codex reset-credit private fallback 改為預設啟用，讓 dashboard 預設顯示可用的 reset credits。
@@ -42,3 +46,4 @@
 [0.3.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.0
 [0.3.1]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.1
 [0.3.2]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.2
+[0.3.3]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.3
