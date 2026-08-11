@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.2.0`  
+目前版本：`v0.3.0`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
@@ -14,6 +14,7 @@ Repository：<https://github.com/AdemKao/ai-monitor>
 - `codex credits` 與 `codex expiring` 預設只使用 Codex app-server 回傳的資料；private endpoint fallback 必須明確 opt-in。
 - `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
+- `update` 直接從 GitHub Release 檢查、驗證 checksum 並更新目前的 `ai-monitor` binary，不需要 local checkout。
 - 所有資料型命令支援 terminal 或 pretty JSON 輸出；另有 `doctor` 與 shell `completion`。
 - 兼容以 `chatgpt-status` 與 `opencode-daily-usage` 作為 executable basename 的 legacy alias，但不承諾完整舊 CLI flag 相容。
 
@@ -38,22 +39,34 @@ installer 預設安裝到 Cargo binary 目錄，通常是 `~/.cargo/bin`。執�
 
 ### 更新已安裝版本
 
-一般使用者不要用 local checkout 覆蓋安裝。每次 release 後，重新執行同一個 latest installer 即可安全更新；它會替換 binary，不會搬移或刪除 Codex profiles、OpenCode database 或 auth。
+一般使用者不需要用 local checkout 或 `cargo install` 更新。已安裝 v0.3.0 後，直接執行：
+
+```sh
+ai-monitor update
+```
+
+它會從 GitHub latest Release 下載目前平台 archive，驗證 SHA-256 後原子替換 binary，不會搬移或刪除 Codex profiles、OpenCode database 或 auth。非互動環境使用 `--yes`；只檢查版本使用 `--check`：
+
+```sh
+ai-monitor update --check
+ai-monitor update --yes
+```
+
+v0.3.0 是 direct update 的第一個版本；v0.2.0 使用者先用一次 GitHub installer bootstrap，之後即可使用 `ai-monitor update`。若 installer 是 fallback，仍可使用：
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/AdemKao/ai-monitor/releases/latest/download/ai-monitor-installer.sh | sh
-ai-monitor --version
 ```
 
-需要固定版本時，將 `latest` 改成版本 tag，例如 `v0.2.0`。更新後若目前 shell 找不到新 binary，執行 `rehash` 或重新開啟 terminal。`cargo install --path .` 僅供專案開發與測試，不是一般使用者的更新方式。
+更新後若目前 shell 找不到新 binary，執行 `rehash` 或重新開啟 terminal。`cargo install --path .` 僅供專案開發與測試，不是一般使用者的更新方式。
 
 ### Cargo
 
 從指定 Git tag 安裝（開發者用途）：
 
 ```sh
-cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.2.0 ai-monitor
+cargo install --git https://github.com/AdemKao/ai-monitor --tag v0.3.0 ai-monitor
 ```
 
 在本機 checkout 安裝目前原始碼：
@@ -235,6 +248,7 @@ ai-monitor codex logout --profile work
 | `codex` | 見下表 | Codex profile、帳號與 limits |
 | `opencode` | 見下表 | OpenCode usage 與 optional index |
 | `doctor` | 無 | 檢查 binary 與本機 storage path |
+| `update` | `--check`；`--yes`；`--force` | 從 GitHub latest Release 驗證並更新目前 binary |
 | `completion <SHELL>` | `bash`、`elvish`、`fish`、`powershell`、`zsh` | 輸出 completion script |
 
 ### Codex commands

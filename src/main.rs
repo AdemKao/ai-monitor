@@ -11,6 +11,7 @@ use ai_monitor::codex::{
 };
 use ai_monitor::model::{Usage, UsageReport};
 use ai_monitor::opencode::{OpenCodeProvider, discover_db_path};
+use ai_monitor::update;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -73,6 +74,18 @@ enum Commands {
     },
     /// Check local provider dependencies and storage.
     Doctor,
+    /// Check for and install the latest GitHub Release.
+    Update {
+        /// Only check the latest release without replacing the binary.
+        #[arg(long)]
+        check: bool,
+        /// Replace the current binary without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Reinstall even when the current version is already current.
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate shell completion scripts.
     Completion { shell: Shell },
 }
@@ -183,6 +196,8 @@ struct ProfileResult {
     snapshot: Option<Snapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_error: Option<String>,
 }
 
 fn main() {
@@ -204,6 +219,7 @@ fn run() -> Result<()> {
         Commands::Codex { command } => run_codex(cli.format, cli.color, command),
         Commands::Opencode { command } => run_opencode(cli.format, command),
         Commands::Doctor => run_doctor(cli.format),
+        Commands::Update { check, yes, force } => run_update(cli.format, check, yes, force),
         Commands::Completion { shell } => {
             generate(
                 shell,
@@ -213,6 +229,73 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+fn run_update(format: OutputFormat, check_only: bool, yes: bool, force: bool) -> Result<()> {
+    let info = update::check()?;
+    let available = force || info.latest > info.current;
+    if matches!(format, OutputFormat::Json) {
+        if !check_only && available && !yes {
+            bail!("JSON updates require --yes");
+        }
+        if check_only || !available {
+            return output_value(
+                format,
+                &json!({
+                    "current": info.current.to_string(),
+                    "latest": info.latest.to_string(),
+                    "latest_tag": info.latest_tag,
+                    "update_available": available,
+                    "updated": false,
+                }),
+            );
+        }
+    } else if !available {
+        println!("ai-monitor {} is already up to date.", info.current);
+        return Ok(());
+    } else if check_only {
+        println!(
+            "Update available: {} -> {} ({})",
+            info.current, info.latest, info.latest_tag
+        );
+        return Ok(());
+    } else if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("non-interactive updates require --yes");
+        }
+        println!(
+            "Update ai-monitor {} -> {}? [y/N]",
+            info.current, info.latest
+        );
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("could not read update confirmation")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Update cancelled.");
+            return Ok(());
+        }
+    }
+
+    let installed = update::install_latest()?;
+    if matches!(format, OutputFormat::Json) {
+        output_value(
+            format,
+            &json!({
+                "current": installed.current.to_string(),
+                "latest": installed.latest.to_string(),
+                "latest_tag": installed.latest_tag,
+                "update_available": true,
+                "updated": true,
+            }),
+        )
+    } else {
+        println!(
+            "Updated ai-monitor {} -> {}. Restart the command to use the new binary.",
+            installed.current, installed.latest
+        );
+        Ok(())
     }
 }
 
@@ -467,14 +550,17 @@ fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
             authenticated: false,
             snapshot: None,
             error: None,
+            credit_error: None,
         };
     }
 
     match fetch(profile) {
         Ok(mut snapshot) => {
+            let mut credit_error = None;
             if allow_private_api && snapshot.reset_credits.credits.is_none() {
-                if let Ok(credits) = detailed_credits(profile, &snapshot, true) {
-                    snapshot.reset_credits = credits;
+                match detailed_credits(profile, &snapshot, true) {
+                    Ok(credits) => snapshot.reset_credits = credits,
+                    Err(error) => credit_error = Some(error.to_string()),
                 }
             }
             ProfileResult {
@@ -482,6 +568,7 @@ fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
                 authenticated: true,
                 snapshot: Some(snapshot),
                 error: None,
+                credit_error,
             }
         }
         Err(error) => ProfileResult {
@@ -489,6 +576,7 @@ fn fetch_profile(profile: &Profile, allow_private_api: bool) -> ProfileResult {
             authenticated: true,
             snapshot: None,
             error: Some(error.to_string()),
+            credit_error: None,
         },
     }
 }
@@ -513,6 +601,7 @@ fn run_overview(
                 authenticated: false,
                 snapshot: None,
                 error: Some(error.to_string()),
+                credit_error: None,
             }]
         });
     if matches!(format, OutputFormat::Json) {
@@ -669,6 +758,47 @@ impl Theme {
     }
 }
 
+fn ui_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(96)
+        .saturating_sub(4)
+        .clamp(76, 100)
+}
+
+fn visible_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut escape = false;
+    for character in value.chars() {
+        if escape {
+            if character == 'm' {
+                escape = false;
+            }
+        } else if character == '\x1b' {
+            escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(visible_width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn styled_cell(theme: &Theme, value: &str, width: usize, code: &str, right: bool) -> String {
+    let value = truncate(value, width);
+    let padded = if right {
+        format!("{value:>width$}")
+    } else {
+        format!("{value:<width$}")
+    };
+    theme.paint(padded, code)
+}
+
 const BOLD: &str = "1";
 const DIM: &str = "2";
 const RED: &str = "31";
@@ -695,42 +825,37 @@ fn output_codex_dashboard(
     }
 
     let theme = Theme::new(color);
+    let width = ui_width();
     let ready = results
         .iter()
         .filter(|result| result.snapshot.is_some())
         .count();
     println!();
     println!(
-        "{}",
-        theme.paint(
-            "╭─ CODEX USAGE DASHBOARD ─────────────────────────────╮",
-            BOLD
-        )
+        "╭{}╮",
+        pad_visible(&theme.paint("─ CODEX USAGE DASHBOARD ", BOLD), width)
     );
     println!(
-        "{}",
-        theme.paint(
-            format!(
-                "│ Accounts: {} total · {} ready · {} │",
-                results.len(),
-                ready,
-                selected
-                    .map(|name| format!("selected: {name}"))
-                    .unwrap_or_else(|| "all accounts".to_owned())
+        "│{}│",
+        pad_visible(
+            &theme.paint(
+                format!(
+                    " Accounts: {} total · {} ready · {}",
+                    results.len(),
+                    ready,
+                    selected
+                        .map(|name| format!("selected: {name}"))
+                        .unwrap_or_else(|| "all accounts".to_owned())
+                ),
+                CYAN,
             ),
-            CYAN,
+            width
         )
     );
-    println!(
-        "{}",
-        theme.paint(
-            "╰──────────────────────────────────────────────────────╯",
-            BOLD
-        )
-    );
+    println!("╰{}╯", "─".repeat(width));
     println!();
     println!("{}", theme.paint("ACCOUNT OVERVIEW", BOLD));
-    println!("  PROFILE       STATUS       USAGE       RESET              CREDITS");
+    println!("  > PROFILE       STATUS       USAGE       RESET                 CREDITS");
     for result in results {
         render_account_summary(&theme, result, selected);
     }
@@ -741,7 +866,7 @@ fn output_codex_dashboard(
         println!("  No Codex accounts found. Run `ai-monitor codex login NAME`.");
     }
     for result in results {
-        render_account_card(&theme, result, selected, allow_private_api);
+        render_account_card(&theme, result, selected, allow_private_api, width);
     }
 
     if !allow_private_api && results.iter().any(missing_credit_details) {
@@ -765,29 +890,36 @@ fn render_account_summary(theme: &Theme, result: &ProfileResult, selected: Optio
     };
     let name = truncate(&result.profile, 12);
     let Some(snapshot) = &result.snapshot else {
-        let status = if result.authenticated {
-            theme.paint("[ERROR]", RED)
+        let (status, status_code) = if result.authenticated {
+            ("[ERROR]", RED)
         } else {
-            theme.paint("[LOGIN]", YELLOW)
+            ("[LOGIN]", YELLOW)
         };
         println!(
-            "  {marker} {name:<12} {status:<12} {:<10} {:<18} not ready",
-            "-", "-"
+            "  {marker} {:<12} {} {} {} {}",
+            name,
+            styled_cell(theme, status, 12, status_code, false),
+            styled_cell(theme, "-", 8, DIM, true),
+            styled_cell(theme, "-", 20, DIM, false),
+            styled_cell(theme, "not ready", 18, DIM, false)
         );
         return;
     };
 
-    let status = theme.paint("[READY]", GREEN);
     let (usage, usage_code) = primary_usage(snapshot);
-    let usage_text = theme.paint(format!("{usage:>5.1}%"), usage_code);
+    let usage_text = format!("{usage:.1}%");
     let reset = primary_limit(snapshot)
         .and_then(|limit| limit.resets_at)
         .map(format_reset_summary)
         .unwrap_or_else(|| "unknown".to_owned());
-    let credits = format_credit_count(theme, &snapshot.reset_credits);
+    let (credits, credits_code) = credit_count_parts(&snapshot.reset_credits);
     println!(
-        "  {marker} {name:<12} {status:<12} {usage_text:<10} {:<18} {}",
-        reset, credits
+        "  {marker} {:<12} {} {} {} {}",
+        name,
+        styled_cell(theme, "[READY]", 12, GREEN, false),
+        styled_cell(theme, &usage_text, 8, usage_code, true),
+        styled_cell(theme, &reset, 20, DIM, false),
+        styled_cell(theme, &credits, 18, credits_code, false)
     );
 }
 
@@ -796,6 +928,7 @@ fn render_account_card(
     result: &ProfileResult,
     selected: Option<&str>,
     allow_private_api: bool,
+    width: usize,
 ) {
     let selected_marker = if selected == Some(result.profile.as_str()) {
         " <selected>"
@@ -803,15 +936,11 @@ fn render_account_card(
         ""
     };
     println!();
-    println!(
-        "  {}",
-        theme.paint(
-            format!(
-                "┌─ {}{} ─────────────────────────────────────────────",
-                result.profile, selected_marker
-            ),
-            CYAN,
-        )
+    println!("  ┌{}┐", "─".repeat(width));
+    card_line(
+        theme,
+        width,
+        &theme.paint(format!(" {}{}", result.profile, selected_marker), CYAN),
     );
 
     let Some(snapshot) = &result.snapshot else {
@@ -823,8 +952,8 @@ fn render_account_card(
         } else {
             "Not logged in"
         };
-        println!("  │ {}", theme.paint(message, YELLOW));
-        println!("  └──────────────────────────────────────────────────");
+        card_line(theme, width, &theme.paint(format!(" {message}"), YELLOW));
+        println!("  └{}┘", "─".repeat(width));
         return;
     };
 
@@ -833,11 +962,15 @@ fn render_account_card(
         snapshot.account.email.as_deref().unwrap_or("unknown"),
         snapshot.account.plan_type.as_deref().unwrap_or("unknown")
     );
-    println!("  │ Account: {}", truncate(&account, 64));
-    println!("  │");
-    println!("  │ {}", theme.paint("RATE LIMITS", BOLD));
+    card_line(
+        theme,
+        width,
+        &format!(" Account: {}", truncate(&account, width.saturating_sub(10))),
+    );
+    card_line(theme, width, "");
+    card_line(theme, width, &theme.paint(" RATE LIMITS", BOLD));
     if snapshot.limits.is_empty() {
-        println!("  │   No rate-limit window returned by Codex.");
+        card_line(theme, width, "   No rate-limit window returned by Codex.");
     }
     for limit in &snapshot.limits {
         let (usage, usage_code) = limit_usage(limit);
@@ -847,58 +980,89 @@ fn render_account_card(
             .resets_at
             .map(format_reset_time)
             .unwrap_or_else(|| "unknown".to_owned());
-        println!(
-            "  │   {:<9} {} {}  reset {}",
-            limit_label(limit),
-            bar,
-            percentage,
-            reset
+        card_line(
+            theme,
+            width,
+            &format!(
+                "   {:<9} {} {}  reset {}",
+                limit_label(limit),
+                bar,
+                percentage,
+                reset
+            ),
         );
     }
-    println!("  │");
-    println!("  │ {}", theme.paint("RESET CREDITS", BOLD));
-    println!(
-        "  │   Available: {}  Source: {}",
-        format_credit_count(theme, &snapshot.reset_credits),
-        snapshot.reset_credits.source
+    card_line(theme, width, "");
+    card_line(theme, width, &theme.paint(" RESET CREDITS", BOLD));
+    card_line(
+        theme,
+        width,
+        &format!(
+            "   Available: {}  Source: {}",
+            format_credit_count(theme, &snapshot.reset_credits),
+            snapshot.reset_credits.source
+        ),
     );
-    render_credit_details(theme, &snapshot.reset_credits, allow_private_api);
+    render_credit_details(
+        theme,
+        &snapshot.reset_credits,
+        allow_private_api,
+        result.credit_error.as_deref(),
+        width,
+    );
     if let Some(error) = &snapshot.usage_error {
-        println!("  │   Usage activity: {}", theme.paint(error, DIM));
+        card_line(
+            theme,
+            width,
+            &format!("   Usage activity: {}", theme.paint(error, DIM)),
+        );
     }
-    println!("  └──────────────────────────────────────────────────");
+    println!("  └{}┘", "─".repeat(width));
 }
 
-fn render_credit_details(theme: &Theme, credits: &ResetCredits, allow_private_api: bool) {
+fn card_line(_theme: &Theme, width: usize, content: &str) {
+    println!("  │{}│", pad_visible(content, width));
+}
+
+fn render_credit_details(
+    theme: &Theme,
+    credits: &ResetCredits,
+    allow_private_api: bool,
+    detail_error: Option<&str>,
+    width: usize,
+) {
     match credits.credits.as_deref() {
         Some(rows) => {
             if rows.is_empty() {
                 if credits.available_count.unwrap_or(0) > 0 {
-                    println!(
-                        "  │   {}",
-                        theme.paint("Expiry details unavailable from app-server", YELLOW)
+                    card_line(
+                        theme,
+                        width,
+                        &theme.paint("   Expiry details unavailable from app-server", YELLOW),
                     );
                 } else {
-                    println!("  │   No reset credits currently available.");
+                    card_line(theme, width, "   No reset credits currently available.");
                 }
             } else {
                 for (index, credit) in rows.iter().enumerate() {
-                    render_credit(theme, index + 1, credit);
+                    render_credit(theme, index + 1, credit, width);
                 }
             }
         }
         None => {
-            let hint = if allow_private_api {
+            let hint = if let Some(error) = detail_error {
+                error
+            } else if allow_private_api {
                 "Private credit detail lookup failed or returned no rows"
             } else {
                 "Expiry details require --allow-private-api"
             };
-            println!("  │   {}", theme.paint(hint, YELLOW));
+            card_line(theme, width, &theme.paint(format!("   {hint}"), YELLOW));
         }
     }
 }
 
-fn render_credit(theme: &Theme, index: usize, credit: &ResetCredit) {
+fn render_credit(theme: &Theme, index: usize, credit: &ResetCredit, width: usize) {
     let status = credit.status.as_deref().unwrap_or("available");
     let status_code = if matches!(status, "active" | "available") {
         GREEN
@@ -917,11 +1081,15 @@ fn render_credit(theme: &Theme, index: usize, credit: &ResetCredit) {
             theme.paint(label, expiry_color(time))
         })
         .unwrap_or_else(|| "no expiry".to_owned());
-    println!(
-        "  │   #{index:<2} {}  {:<24} expires {}",
-        theme.paint(status, status_code),
-        title,
-        expires
+    card_line(
+        theme,
+        width,
+        &format!(
+            "   #{index:<2} {}  {:<24} expires {}",
+            theme.paint(status, status_code),
+            title,
+            expires
+        ),
     );
 }
 
@@ -959,10 +1127,15 @@ fn limit_usage(limit: &LimitWindow) -> (f64, &'static str) {
 }
 
 fn format_credit_count(theme: &Theme, credits: &ResetCredits) -> String {
+    let (text, color) = credit_count_parts(credits);
+    theme.paint(text, color)
+}
+
+fn credit_count_parts(credits: &ResetCredits) -> (String, &'static str) {
     match credits.available_count {
-        Some(0) => theme.paint("0 available", DIM),
-        Some(count) => theme.paint(format!("{count} available"), GREEN),
-        None => theme.paint("unknown", YELLOW),
+        Some(0) => ("0 available".to_owned(), DIM),
+        Some(count) => (format!("{count} available"), GREEN),
+        None => ("unknown".to_owned(), YELLOW),
     }
 }
 

@@ -2,6 +2,12 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.3.0] - 2026-08-11
+
+- 新增 `update`、`update --check`、`update --yes` 與 `update --force`，直接從 GitHub Release 驗證 checksum 後更新 binary。
+- Codex dashboard 改用固定可見寬度與 ANSI-aware padding，修正不同顏色與長度造成的欄位、card 邊框不對齊。
+- private credit lookup 遇到 HTTP 429 時顯示 rate-limit 原因，不再籠統顯示 lookup failed。
+
 ## [0.2.0] - 2026-08-11
 
 - `codex usage` 改為視覺化多帳號 dashboard，顯示帳號數量、各帳號 usage、reset time、reset credit 與 credit expiry。
@@ -22,3 +28,4 @@
 
 [0.1.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.1.0
 [0.2.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.2.0
+[0.3.0]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.0

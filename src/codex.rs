@@ -53,6 +53,8 @@ pub enum Error {
     Rpc,
     #[error("private credit lookup failed")]
     PrivateCredits,
+    #[error("private credit lookup was rate limited")]
+    PrivateCreditsRateLimited,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -589,6 +591,9 @@ fn fetch_private_credits(profile: &Profile) -> Result<ResetCredits> {
         request = request.header("ChatGPT-Account-ID", account_id);
     }
     let response = request.send().map_err(|_| Error::PrivateCredits)?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(Error::PrivateCreditsRateLimited);
+    }
     if !response.status().is_success() {
         return Err(Error::PrivateCredits);
     }

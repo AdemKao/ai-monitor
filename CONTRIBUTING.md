@@ -40,6 +40,8 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/AdemKao/ai-monitor/releases/latest/download/ai-monitor-installer.sh | sh
 ```
 
+v0.3.0 起，一般使用者也可以執行 `ai-monitor update --check` 或 `ai-monitor update --yes`；該流程只能下載 GitHub Release artifact，並會驗證 SHA-256。修改 update pipeline 時，必須保留 checksum verification 與 atomic self-replace 行為。
+
 建立 release 前必須更新 `Cargo.toml`、`Cargo.lock`、`CHANGELOG.md` 與 `README.md`，通過 CI 後建立 `vX.Y.Z` tag。GitHub Actions 會建置各平台 archive、installer 與 checksum；不要把本機 build output、credentials 或 database 上傳到 release。
 
 ## License
