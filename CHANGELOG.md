@@ -2,6 +2,10 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.3.5] - 2026-08-11
+
+- Terminal rate-limit dashboard 只顯示剩餘容量；`used_percent` 仍保留於 JSON 與內部資料。
+
 ## [0.3.4] - 2026-08-11
 
 - Codex rate-limit dashboard 明確標示 `used` 與 `remaining` 百分比，避免進度條語意不清。
@@ -52,3 +56,4 @@
 [0.3.2]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.2
 [0.3.3]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.3
 [0.3.4]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.4
+[0.3.5]: https://github.com/AdemKao/ai-monitor/releases/tag/v0.3.5

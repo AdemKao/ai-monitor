@@ -1002,7 +1002,7 @@ fn output_codex_dashboard(
     println!("╰{}╯", "─".repeat(width));
     println!();
     println!("{}", theme.paint("ACCOUNT OVERVIEW", BOLD));
-    println!("  > PROFILE       STATUS       USED        RESET                 CREDITS");
+    println!("  > PROFILE       STATUS       REMAINING   RESET                 CREDITS");
     for result in results {
         render_account_summary(&theme, result, selected);
     }
@@ -1053,8 +1053,9 @@ fn render_account_summary(theme: &Theme, result: &ProfileResult, selected: Optio
         return;
     };
 
-    let (usage, usage_code) = primary_usage(snapshot);
-    let usage_text = format!("{usage:.1}%");
+    let (usage, _) = primary_usage(snapshot);
+    let (remaining, remaining_code) = remaining_usage(usage);
+    let remaining_text = format!("{remaining:.1}%");
     let reset = primary_limit(snapshot)
         .and_then(|limit| limit.resets_at)
         .map(format_reset_summary)
@@ -1064,7 +1065,7 @@ fn render_account_summary(theme: &Theme, result: &ProfileResult, selected: Optio
         "  {marker} {:<12} {} {} {} {}",
         name,
         styled_cell(theme, "[READY]", 12, GREEN, false),
-        styled_cell(theme, &usage_text, 8, usage_code, true),
+        styled_cell(theme, &remaining_text, 8, remaining_code, true),
         styled_cell(theme, &reset, 20, DIM, false),
         styled_cell(theme, &credits, 18, credits_code, false)
     );
@@ -1120,17 +1121,9 @@ fn render_account_card(
         card_line(theme, width, "   No rate-limit window returned by Codex.");
     }
     for limit in &snapshot.limits {
-        let (usage, usage_code) = limit_usage(limit);
-        let remaining_percent = 100.0 - usage;
-        let remaining_code = if remaining_percent <= 10.0 {
-            RED
-        } else if remaining_percent <= 25.0 {
-            YELLOW
-        } else {
-            GREEN
-        };
-        let bar = theme.paint(progress_bar(usage, 24), usage_code);
-        let used = theme.paint(format!("{usage:>5.1}%"), usage_code);
+        let (usage, _) = limit_usage(limit);
+        let (remaining_percent, remaining_code) = remaining_usage(usage);
+        let bar = theme.paint(progress_bar(remaining_percent, 24), remaining_code);
         let remaining = theme.paint(format!("{remaining_percent:>5.1}%"), remaining_code);
         let reset = limit
             .resets_at
@@ -1139,12 +1132,7 @@ fn render_account_card(
         card_line(
             theme,
             width,
-            &format!(
-                "   {:<9} used {}  remaining {}",
-                limit_label(limit),
-                used,
-                remaining
-            ),
+            &format!("   {:<9} remaining {}", limit_label(limit), remaining),
         );
         card_line(
             theme,
@@ -1284,6 +1272,18 @@ fn limit_usage(limit: &LimitWindow) -> (f64, &'static str) {
         GREEN
     };
     (usage, color)
+}
+
+fn remaining_usage(usage: f64) -> (f64, &'static str) {
+    let remaining = 100.0 - usage.clamp(0.0, 100.0);
+    let color = if remaining <= 10.0 {
+        RED
+    } else if remaining <= 25.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+    (remaining, color)
 }
 
 fn format_credit_count(theme: &Theme, credits: &ResetCredits) -> String {
@@ -1451,5 +1451,11 @@ mod tests {
             panic!("expected codex all command");
         };
         assert!(!private_api.enabled());
+    }
+
+    #[test]
+    fn remaining_usage_is_the_inverse_of_used_usage() {
+        assert_eq!(remaining_usage(28.0), (72.0, GREEN));
+        assert_eq!(remaining_usage(90.0), (10.0, RED));
     }
 }
