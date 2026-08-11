@@ -7,6 +7,11 @@ name: Release
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to build and publish"
+        required: true
+        type: string
   push:
     tags:
       - 'v*'
@@ -22,8 +27,8 @@ jobs:
       contents: read
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      tag: ${{ !github.event.pull_request && (inputs.release_tag || github.ref_name) || '' }}
+      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', inputs.release_tag || github.ref_name) || '' }}
       publishing: ${{ !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -31,6 +36,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install dist
@@ -45,7 +51,7 @@ jobs:
         name: Plan release
         shell: bash
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', inputs.release_tag || github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "manifest=$(jq -c '.' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
       - name: Upload plan manifest
         uses: actions/upload-artifact@v4
@@ -73,6 +79,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Install Rust in build containers
@@ -126,6 +133,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Fetch cached dist
@@ -179,6 +187,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
           submodules: recursive
       - name: Fetch cached dist
