@@ -621,8 +621,16 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
                 store.resolve(Some(name))?;
             }
             let use_private_api = private_api.enabled();
+            let queried_at = Local::now();
             let results = fetch_all(&store, use_private_api, profile.as_deref())?;
-            output_codex_dashboard(format, &results, profile.as_deref(), color, use_private_api)?;
+            output_codex_dashboard(
+                format,
+                &results,
+                profile.as_deref(),
+                color,
+                use_private_api,
+                queried_at,
+            )?;
         }
         CodexCommands::Credits {
             profile,
@@ -697,8 +705,9 @@ fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> 
         }
         CodexCommands::All { private_api } => {
             let use_private_api = private_api.enabled();
+            let queried_at = Local::now();
             let results = fetch_all(&store, use_private_api, None)?;
-            output_codex_dashboard(format, &results, None, color, use_private_api)?;
+            output_codex_dashboard(format, &results, None, color, use_private_api, queried_at)?;
         }
         CodexCommands::Run { profile, args } => {
             let profile = store.resolve(profile.as_deref())?;
@@ -786,6 +795,7 @@ fn run_overview(
     let report = provider(db)
         .usage(days, all_projects, project.as_deref())
         .context("failed to read OpenCode usage")?;
+    let codex_queried_at = Local::now();
     let codex = ProfileStore::from_env()
         .map_err(anyhow::Error::from)
         .and_then(|store| fetch_all(&store, use_private_api, None))
@@ -802,7 +812,14 @@ fn run_overview(
         output_value(format, &json!({"opencode": report, "codex": codex}))
     } else {
         println!("CODEX");
-        output_codex_dashboard(OutputFormat::Terminal, &codex, None, color, use_private_api)?;
+        output_codex_dashboard(
+            OutputFormat::Terminal,
+            &codex,
+            None,
+            color,
+            use_private_api,
+            codex_queried_at,
+        )?;
         println!("\nOPENCODE");
         output_usage(format, &report, false, 10)
     }
@@ -1128,11 +1145,13 @@ fn output_codex_dashboard(
     selected: Option<&str>,
     color: ColorMode,
     use_private_api: bool,
+    queried_at: DateTime<Local>,
 ) -> Result<()> {
     if matches!(format, OutputFormat::Json) {
         return output_value(
             format,
             &json!({
+                "queried_at": queried_at.to_rfc3339(),
                 "account_count": results.len(),
                 "selected_profile": selected,
                 "accounts": results,
@@ -1166,6 +1185,16 @@ fn output_codex_dashboard(
                 CYAN,
             ),
             width
+        )
+    );
+    println!(
+        "│{}│",
+        pad_visible(
+            &theme.paint(
+                format!(" Queried: {}", queried_at.format("%Y-%m-%d %H:%M:%S %:z")),
+                DIM,
+            ),
+            width,
         )
     );
     println!("╰{}╯", "─".repeat(width));
