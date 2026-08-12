@@ -41,8 +41,8 @@ pub enum Error {
     Storage(#[source] std::io::Error),
     #[error("could not start Codex")]
     Launch(#[source] std::io::Error),
-    #[error("Codex command failed")]
-    CommandFailed,
+    #[error("profile '{profile}' is already authenticated; use --force to log in again")]
+    AlreadyAuthenticated { profile: String },
     #[error("Codex app-server request timed out")]
     Timeout,
     #[error("Codex app-server closed unexpectedly")]
@@ -266,7 +266,9 @@ fn isolated_command(profile: &Profile) -> Command {
 pub fn login(store: &ProfileStore, name: &str, force: bool) -> Result<ExitStatus> {
     let profile = store.create(name)?;
     if profile.authenticated && !force {
-        return Err(Error::CommandFailed);
+        return Err(Error::AlreadyAuthenticated {
+            profile: profile.name,
+        });
     }
     isolated_command(&profile)
         .arg("login")
@@ -721,6 +723,24 @@ mod tests {
         assert!(validate_profile_name("main").is_ok());
         assert!(validate_profile_name("../main").is_err());
         assert!(validate_profile_name("bad name").is_err());
+    }
+
+    #[test]
+    fn login_requires_force_for_authenticated_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(temp.path());
+        let profile = store.create("main").unwrap();
+        fs::write(profile.auth_file(), "{}").unwrap();
+
+        let error = login(&store, "main", false).unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::AlreadyAuthenticated { profile } if profile == "main"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "profile 'main' is already authenticated; use --force to log in again"
+        );
     }
 
     #[test]

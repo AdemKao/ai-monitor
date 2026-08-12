@@ -2,6 +2,10 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.4.2] - 2026-08-12
+
+- Codex profile 已有登入資料時，`codex login` 顯示明確原因與 `--force` 操作提示。
+
 ## [0.4.1] - 2026-08-11
 
 - 新增 `PRIMARY -> SUBAGENT RELATIONSHIPS`，顯示 spawns、calls、tokens 與 share。

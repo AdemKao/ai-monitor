@@ -2,7 +2,7 @@
 
 `ai-monitor` 是以 Rust 撰寫的本機 AI coding tool 使用量與帳號狀態 CLI，整合 Codex profile、Codex rate limits／reset credits，以及 OpenCode SQLite usage。
 
-目前版本：`v0.4.1`  
+目前版本：`v0.4.2`  
 Repository：<https://github.com/AdemKao/ai-monitor>
 
 ## 功能
