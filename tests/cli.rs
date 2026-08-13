@@ -67,3 +67,16 @@ fn opencode_dashboard_help_exposes_breakdown_options() {
         .stdout(predicate::str::contains("--top-agents"))
         .stdout(predicate::str::contains("--top-relationships"));
 }
+
+#[test]
+fn usage_help_exposes_time_range_presets() {
+    Command::cargo_bin("ai-monitor")
+        .unwrap()
+        .args(["opencode", "usage", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--range"))
+        .stdout(predicate::str::contains("today"))
+        .stdout(predicate::str::contains("yesterday"))
+        .stdout(predicate::str::contains("30-days"));
+}

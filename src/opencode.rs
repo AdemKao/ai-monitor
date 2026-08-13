@@ -44,6 +44,13 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsagePeriod {
+    Today,
+    Yesterday,
+    LastDays(u32),
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct DashboardReport {
     pub source: String,
@@ -100,7 +107,16 @@ impl OpenCodeProvider {
         all_projects: bool,
         project: Option<&Path>,
     ) -> Result<UsageReport> {
-        let range = DateRange::for_days(days, Local::now())?;
+        self.usage_period(UsagePeriod::LastDays(days), all_projects, project)
+    }
+
+    pub fn usage_period(
+        &self,
+        period: UsagePeriod,
+        all_projects: bool,
+        project: Option<&Path>,
+    ) -> Result<UsageReport> {
+        let range = DateRange::for_period(period, Local::now())?;
         let path = discover_db_path(self.explicit_db_path.as_deref())?;
         let connection = open_database(&path, true)?;
         validate_schema(&connection)?;
@@ -164,7 +180,16 @@ impl OpenCodeProvider {
         all_projects: bool,
         project: Option<&Path>,
     ) -> Result<DashboardReport> {
-        let range = DateRange::for_days(days, Local::now())?;
+        self.dashboard_period(UsagePeriod::LastDays(days), all_projects, project)
+    }
+
+    pub fn dashboard_period(
+        &self,
+        period: UsagePeriod,
+        all_projects: bool,
+        project: Option<&Path>,
+    ) -> Result<DashboardReport> {
+        let range = DateRange::for_period(period, Local::now())?;
         let path = discover_db_path(self.explicit_db_path.as_deref())?;
         let connection = open_database(&path, true)?;
         validate_schema(&connection)?;
@@ -359,15 +384,26 @@ struct DateRange {
 }
 
 impl DateRange {
-    fn for_days(days: u32, now: DateTime<Local>) -> Result<Self> {
-        if days == 0 {
-            return Err(Error::InvalidDays);
-        }
-
-        let end = now.date_naive();
-        let start = end
-            .checked_sub_signed(Duration::days(i64::from(days - 1)))
-            .ok_or(Error::InvalidDateRange)?;
+    fn for_period(period: UsagePeriod, now: DateTime<Local>) -> Result<Self> {
+        let today = now.date_naive();
+        let (start, end) = match period {
+            UsagePeriod::Today => (today, today),
+            UsagePeriod::Yesterday => {
+                let yesterday = today
+                    .checked_sub_signed(Duration::days(1))
+                    .ok_or(Error::InvalidDateRange)?;
+                (yesterday, yesterday)
+            }
+            UsagePeriod::LastDays(days) => {
+                if days == 0 {
+                    return Err(Error::InvalidDays);
+                }
+                let start = today
+                    .checked_sub_signed(Duration::days(i64::from(days - 1)))
+                    .ok_or(Error::InvalidDateRange)?;
+                (start, today)
+            }
+        };
         let end_exclusive = end
             .checked_add_signed(Duration::days(1))
             .ok_or(Error::InvalidDateRange)?;

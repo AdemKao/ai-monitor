@@ -2,6 +2,11 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.4.3] - 2026-08-13
+
+- OpenCode terminal usage 與 overview 新增 today／yesterday／30-days range preset、成本／token摘要、provider 成本分布與每日 usage trend。
+- Codex quota dashboard 維持只顯示 app-server 真實提供的 plan、5 hour／weekly rate limits、reset time、reset credits 與 expiry 狀態；沒有歷史資料的欄位不會捏造。
+
 ## [0.4.2] - 2026-08-12
 
 - Codex profile 已有登入資料時，`codex login` 顯示明確原因與 `--force` 操作提示。

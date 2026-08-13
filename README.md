@@ -12,7 +12,8 @@ Repository：<https://github.com/AdemKao/ai-monitor>
 - `codex usage` 會顯示多帳號 dashboard：帳號數量、各帳號用量、reset 時間、reset credit 與 expiry 狀態。
 - terminal dashboard 會以進度條與顏色標示高用量、即將到期與已過期項目；可用 `--color always|never` 控制顏色。
 - `codex credits`、`codex expiring`、`codex usage` 與 `codex all` 預設會查詢 reset credits；可用 `--no-private-api` 停用 private endpoint fallback。
-- `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本。
+- `opencode usage` 以唯讀方式讀取本機 OpenCode database，依日期、provider 與 model 彙總 token、訊息數與成本；terminal 會顯示 provider 成本分布、每日 token trend，以及今日／昨日／近 30 日摘要。
+- `overview` 與 OpenCode usage/dashboard 支援 `--range today|yesterday|30-days`，也保留 `--days` 自訂期間。
 - `opencode dashboard` 以 project → agent／subagent 彙總 token、model call 次數、session 數與比例，支援 terminal 與 JSON。
 - `opencode optimize` 只管理 `ai-monitor` 自己建立的 optional time index；只有 `create --yes`／`remove --yes` 會修改 OpenCode database。
 - `update` 直接從 GitHub Release 檢查、驗證 checksum 並更新目前的 `ai-monitor` binary，不需要 local checkout。
@@ -183,10 +184,13 @@ ai-monitor codex all --no-private-api
 ```sh
 ai-monitor opencode usage
 ai-monitor opencode usage --days 30 --project "$PWD" --top-models 20
+ai-monitor opencode usage --range today
+ai-monitor opencode usage --range yesterday
+ai-monitor opencode usage --range 30-days --all-projects
 ai-monitor opencode usage --all-projects --include-cache
 ```
 
-預設查詢最近 7 天、目前 project、前 10 個 model，token 顯示 input／output／reasoning 的 active token。`--include-cache` 會把 cache read／write token 納入計算；`--top-models 0` 代表不限制 model ranking 數量。
+預設查詢最近 7 天、目前 project、前 10 個 model，token 顯示 input／output／reasoning 的 active token。`--range today`、`--range yesterday` 與 `--range 30-days` 是常用期間 preset，指定時優先於 `--days`。terminal 另外以 30 天 read-only query 產生今日、昨日與近 30 日成本／token摘要；provider 成本分布與 trend 只使用實際 message 的 provider、cost 與 token 欄位。`--include-cache` 會把 cache read／write token 納入計算；`--top-models 0` 代表不限制 model ranking 數量。
 
 OpenCode usage 以 SQLite read-only mode 開啟 database，不會建立 index、不會更新 message，也不會執行 optimize。`--all-projects` 未安裝 index 時會提出可能掃描整個 database 的警告。
 
@@ -194,11 +198,11 @@ OpenCode usage 以 SQLite read-only mode 開啟 database，不會建立 index、
 
 ```sh
 ai-monitor opencode dashboard
-ai-monitor opencode dashboard --all-projects --days 30
+ai-monitor opencode dashboard --all-projects --range 30-days
 ai-monitor opencode dashboard --project "$PWD" --top-agents 0
 ```
 
-dashboard 預設顯示目前 project 最近 7 天的 calls、sessions、active tokens 與 agent／subagent breakdown，也會顯示 parent → subagent 的 spawn、calls 與 token 關係。`--all-projects` 顯示 project overview 與各 project 的 breakdown；terminal 預設顯示 top 10 projects／agents／relationships，使用 `--top-projects 0 --top-agents 0 --top-relationships 0` 顯示全部。`--include-cache` 將 cache read／write tokens 納入顯示 token 數；JSON 會保留完整 breakdown。call count 是 assistant model responses，`compaction` 維護訊息不計入 CTA dashboard。
+dashboard 預設顯示目前 project 最近 7 天的 calls、sessions、active tokens 與 agent／subagent breakdown，也會顯示 parent → subagent 的 spawn、calls 與 token 關係。`--range` 可切換 today、yesterday 或 30-days；`--all-projects` 顯示 project overview 與各 project 的 breakdown；terminal 預設顯示 top 10 projects／agents／relationships，使用 `--top-projects 0 --top-agents 0 --top-relationships 0` 顯示全部。`--include-cache` 將 cache read／write tokens 納入顯示 token 數；JSON 會保留完整 breakdown。call count 是 assistant model responses，`compaction` 維護訊息不計入 CTA dashboard。
 
 dashboard 只掃描指定日期範圍的 `message` 與必要的 `session` metadata，不讀取大型 `part` content。all-project 查詢若未建立 optional time index，可能掃描整張 message table；可在確認會修改第三方 database 後執行 `ai-monitor opencode optimize create --yes`。
 
@@ -271,7 +275,7 @@ ai-monitor codex logout --profile work
 
 | Command | Options | 行為 |
 | --- | --- | --- |
-| `overview` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--no-private-api` | 合併 Codex limits 與 OpenCode usage |
+| `overview` | `-d, --days <DAYS>` 預設 `7`；`--range <today\|yesterday\|30-days>`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--no-private-api` | 合併 Codex limits 與 OpenCode usage；terminal 顯示 OpenCode 成本／token摘要與 provider trend |
 | `codex` | 見下表 | Codex profile、帳號與 limits |
 | `opencode` | 見下表 | OpenCode usage、project dashboard 與 optional index |
 | `doctor` | 無 | 檢查 binary 與本機 storage path |
@@ -298,13 +302,15 @@ ai-monitor codex logout --profile work
 
 | Command | Options | 行為 |
 | --- | --- | --- |
-| `opencode usage` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-models <N>` 預設 `10` | Read-only usage report；省略 project 時使用目前工作目錄 |
-| `opencode dashboard` | `-d, --days <DAYS>` 預設 `7`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-projects <N>`、`--top-agents <N>`、`--top-relationships <N>` 預設 `10` | 依 project、agent／subagent 與 parent relationship 顯示 calls、sessions、tokens 與 share；`0` 代表不限制 |
+| `opencode usage` | `-d, --days <DAYS>` 預設 `7`；`--range <today\|yesterday\|30-days>`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-models <N>` 預設 `10` | Read-only usage report、成本／token摘要、provider 分布與每日 trend；省略 project 時使用目前工作目錄 |
+| `opencode dashboard` | `-d, --days <DAYS>` 預設 `7`；`--range <today\|yesterday\|30-days>`；`--all-projects`；`--project <PATH>`；`--db <PATH>`；`--include-cache`；`--top-projects <N>`、`--top-agents <N>`、`--top-relationships <N>` 預設 `10` | 依 project、agent／subagent 與 parent relationship 顯示 calls、sessions、tokens 與 share；`0` 代表不限制 |
 | `opencode optimize status` | `--db <PATH>` 位於 `optimize` 前 | Read-only 檢查 `ai-monitor` index 是否存在 |
 | `opencode optimize create` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 建立 `ai_monitor_message_time_created_idx`，直接修改第三方 DB |
 | `opencode optimize remove` | `--db <PATH>` 位於 `optimize` 前；`--yes` | 移除 `ai-monitor` 自己的 index，直接修改第三方 DB |
 
 OpenCode database 必須具備 `session(id, project_id, directory)` 與 `message(session_id, time_created, data)` 欄位。usage 與 dashboard 只計算 `role == "assistant"` 的 message；缺少 provider／model 時會使用 `unknown`，無法解析的 timestamp／JSON row 會略過。dashboard 優先使用 `project.worktree`、`message.agent` 與 `session.parent_id`；較舊 schema 缺少 optional 欄位時會使用 session directory 與 agent fallback。
+
+Codex app-server 目前提供即時方案、5 hour／weekly rate limits、reset time、reset credits 與 expiry 狀態；它沒有歷史成本或每日 session usage，因此 overview 不會把 OpenCode 歷史成本數字套用到 Codex。Status／外部 dashboard link 也只有在 provider 或本機資料明確提供時才會顯示，目前沒有可用來源。
 
 ## Codex profiles 與 legacy 相容策略
 

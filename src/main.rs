@@ -11,7 +11,7 @@ use ai_monitor::codex::{
     detailed_credits, expiring, fetch,
 };
 use ai_monitor::model::{BreakdownUsage, Usage, UsageReport};
-use ai_monitor::opencode::{DashboardReport, OpenCodeProvider, discover_db_path};
+use ai_monitor::opencode::{DashboardReport, OpenCodeProvider, UsagePeriod, discover_db_path};
 use ai_monitor::update;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
@@ -74,12 +74,61 @@ enum ColorMode {
     Never,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum UsageRange {
+    Today,
+    Yesterday,
+    #[value(name = "30-days")]
+    ThirtyDays,
+}
+
+impl UsageRange {
+    fn period(self) -> UsagePeriod {
+        match self {
+            Self::Today => UsagePeriod::Today,
+            Self::Yesterday => UsagePeriod::Yesterday,
+            Self::ThirtyDays => UsagePeriod::LastDays(30),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::ThirtyDays => "30 days",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UsageRangeOptions {
+    days: u32,
+    range: Option<UsageRange>,
+}
+
+impl UsageRangeOptions {
+    fn period(self) -> UsagePeriod {
+        self.range
+            .map(UsageRange::period)
+            .unwrap_or(UsagePeriod::LastDays(self.days))
+    }
+
+    fn label(self) -> String {
+        self.range
+            .map(|range| range.label().to_owned())
+            .unwrap_or_else(|| format!("last {} days", self.days))
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Show Codex limits and OpenCode usage together.
     Overview {
         #[arg(short, long, default_value_t = 7)]
         days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
         #[arg(long)]
         all_projects: bool,
         #[arg(long)]
@@ -182,6 +231,9 @@ enum OpenCodeCommands {
     Usage {
         #[arg(short, long, default_value_t = 7)]
         days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
         #[arg(long)]
         all_projects: bool,
         #[arg(long)]
@@ -197,6 +249,9 @@ enum OpenCodeCommands {
     Dashboard {
         #[arg(short, long, default_value_t = 7)]
         days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
         #[arg(long)]
         all_projects: bool,
         #[arg(long)]
@@ -263,6 +318,7 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Overview {
             days,
+            range,
             all_projects,
             project,
             db,
@@ -270,7 +326,7 @@ fn run() -> Result<()> {
         } => run_overview(
             cli.format,
             cli.color,
-            days,
+            UsageRangeOptions { days, range },
             all_projects,
             project,
             db,
@@ -483,6 +539,7 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
     match command {
         OpenCodeCommands::Usage {
             days,
+            range,
             all_projects,
             project,
             db,
@@ -491,17 +548,38 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
         } => {
             let provider = provider(db);
             let report = provider
-                .usage(days, all_projects, project.as_deref())
+                .usage_period(
+                    UsageRangeOptions { days, range }.period(),
+                    all_projects,
+                    project.as_deref(),
+                )
                 .context("failed to read OpenCode usage")?;
             if all_projects && !provider.index_status().unwrap_or(false) {
                 eprintln!(
                     "warning: all-project queries may scan the entire database; run `ai-monitor opencode optimize create --yes` to add the optional time index"
                 );
             }
-            output_usage(format, &report, include_cache, top_models)
+            let summary = if matches!(format, OutputFormat::Terminal) {
+                Some(
+                    provider
+                        .usage_period(UsagePeriod::LastDays(30), all_projects, project.as_deref())
+                        .context("failed to read OpenCode usage summary")?,
+                )
+            } else {
+                None
+            };
+            output_usage(
+                format,
+                &report,
+                summary.as_ref(),
+                include_cache,
+                top_models,
+                UsageRangeOptions { days, range }.label(),
+            )
         }
         OpenCodeCommands::Dashboard {
             days,
+            range,
             all_projects,
             project,
             db,
@@ -512,7 +590,11 @@ fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
         } => {
             let provider = provider(db);
             let report = provider
-                .dashboard(days, all_projects, project.as_deref())
+                .dashboard_period(
+                    UsageRangeOptions { days, range }.period(),
+                    all_projects,
+                    project.as_deref(),
+                )
                 .context("failed to read OpenCode dashboard")?;
             if all_projects && !provider.index_status().unwrap_or(false) {
                 eprintln!(
@@ -786,14 +868,15 @@ fn fetch_profile(profile: &Profile, use_private_api: bool) -> ProfileResult {
 fn run_overview(
     format: OutputFormat,
     color: ColorMode,
-    days: u32,
+    range_options: UsageRangeOptions,
     all_projects: bool,
     project: Option<PathBuf>,
     db: Option<PathBuf>,
     use_private_api: bool,
 ) -> Result<()> {
-    let report = provider(db)
-        .usage(days, all_projects, project.as_deref())
+    let provider = provider(db);
+    let report = provider
+        .usage_period(range_options.period(), all_projects, project.as_deref())
         .context("failed to read OpenCode usage")?;
     let codex_queried_at = Local::now();
     let codex = ProfileStore::from_env()
@@ -821,7 +904,17 @@ fn run_overview(
             codex_queried_at,
         )?;
         println!("\nOPENCODE");
-        output_usage(format, &report, false, 10)
+        let summary = provider
+            .usage_period(UsagePeriod::LastDays(30), all_projects, project.as_deref())
+            .context("failed to read OpenCode usage summary")?;
+        output_usage(
+            format,
+            &report,
+            Some(&summary),
+            false,
+            10,
+            range_options.label(),
+        )
     }
 }
 
@@ -877,16 +970,20 @@ fn output_value(format: OutputFormat, value: &impl Serialize) -> Result<()> {
 fn output_usage(
     format: OutputFormat,
     report: &UsageReport,
+    summary: Option<&UsageReport>,
     include_cache: bool,
     top_models: usize,
+    period: String,
 ) -> Result<()> {
     if matches!(format, OutputFormat::Json) {
         return output_value(format, report);
     }
     println!("Range: {} to {}", report.start_day, report.end_day);
     println!("Scope: {}", report.scope);
+    println!("Period: {period}");
     let mut days = BTreeMap::<String, Usage>::new();
     let mut models = BTreeMap::<String, Usage>::new();
+    let mut providers = BTreeMap::<String, Usage>::new();
     for row in &report.rows {
         days.entry(row.day.clone())
             .or_default()
@@ -895,7 +992,16 @@ fn output_usage(
             .entry(format!("{}/{}", row.provider, row.model))
             .or_default()
             .add_assign(&row.usage);
+        providers
+            .entry(row.provider.clone())
+            .or_default()
+            .add_assign(&row.usage);
     }
+
+    render_usage_summary(summary.unwrap_or(report), report, include_cache);
+    render_provider_costs(&providers);
+    render_usage_trend(&days, include_cache);
+
     println!("\nDAILY USAGE");
     println!("DATE        TOKENS       MSGS       COST");
     for (day, usage) in days {
@@ -939,6 +1045,124 @@ fn output_usage(
         );
     }
     Ok(())
+}
+
+fn aggregate_report(report: &UsageReport) -> Usage {
+    report.rows.iter().fold(Usage::default(), |mut total, row| {
+        total.add_assign(&row.usage);
+        total
+    })
+}
+
+fn render_usage_summary(summary: &UsageReport, selected: &UsageReport, include_cache: bool) {
+    let selected_total = aggregate_report(selected);
+    let summary_by_day =
+        summary
+            .rows
+            .iter()
+            .fold(BTreeMap::<String, Usage>::new(), |mut totals, row| {
+                totals
+                    .entry(row.day.clone())
+                    .or_default()
+                    .add_assign(&row.usage);
+                totals
+            });
+    let today = summary_by_day.get(&summary.end_day);
+    let yesterday = chrono::NaiveDate::parse_from_str(&summary.end_day, "%Y-%m-%d")
+        .ok()
+        .and_then(|day| day.pred_opt())
+        .and_then(|day| summary_by_day.get(&day.to_string()));
+    let last_30 = (!summary.rows.is_empty()).then(|| aggregate_report(summary));
+    let selected_total = (!selected.rows.is_empty()).then_some(selected_total);
+
+    println!("\nCOST & TOKEN SUMMARY");
+    println!("PERIOD       COST          TOKENS       MESSAGES");
+    print_summary_row("TODAY", today, include_cache);
+    print_summary_row("YESTERDAY", yesterday, include_cache);
+    print_summary_row("30 DAYS", last_30.as_ref(), include_cache);
+    print_summary_row("SELECTED", selected_total.as_ref(), include_cache);
+}
+
+fn print_summary_row(label: &str, usage: Option<&Usage>, include_cache: bool) {
+    let Some(usage) = usage else {
+        println!("{label:<11} unavailable (no usage data)");
+        return;
+    };
+    println!(
+        "{label:<11} ${:>10.4}  {:>11}  {:>8}",
+        usage.cost_usd,
+        compact(usage_tokens(usage, include_cache)),
+        usage.messages
+    );
+}
+
+fn render_provider_costs(providers: &BTreeMap<String, Usage>) {
+    println!("\nCOST BY PROVIDER");
+    if providers.is_empty() {
+        println!("No provider cost data available for this range.");
+        return;
+    }
+    let total = providers.values().map(|usage| usage.cost_usd).sum::<f64>();
+    let mut rows = providers.iter().collect::<Vec<_>>();
+    rows.sort_by(|(_, left), (_, right)| {
+        right
+            .cost_usd
+            .partial_cmp(&left.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!("PROVIDER                 COST          SHARE  DISTRIBUTION");
+    for (provider, usage) in rows {
+        let share = if total > 0.0 {
+            usage.cost_usd / total * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{:<22}  ${:>10.4}  {:>6.1}%  {}",
+            truncate(provider, 22),
+            usage.cost_usd,
+            share,
+            progress_bar(share, 18)
+        );
+    }
+}
+
+fn render_usage_trend(days: &BTreeMap<String, Usage>, include_cache: bool) {
+    println!("\nUSAGE TREND");
+    if days.is_empty() {
+        println!("No usage data available for this range.");
+        return;
+    }
+    let maximum = days
+        .values()
+        .map(|usage| usage_tokens(usage, include_cache))
+        .max()
+        .unwrap_or_default();
+    for (day, usage) in days {
+        let tokens = usage_tokens(usage, include_cache);
+        println!(
+            "{}  {} {:>8}  ${:.4}",
+            day,
+            progress_bar_ratio(tokens, maximum, 24),
+            compact(tokens),
+            usage.cost_usd
+        );
+    }
+}
+
+fn usage_tokens(usage: &Usage, include_cache: bool) -> u64 {
+    if include_cache {
+        usage.all_tokens()
+    } else {
+        usage.active_tokens()
+    }
+}
+
+fn progress_bar_ratio(value: u64, maximum: u64, width: usize) -> String {
+    if maximum == 0 {
+        return progress_bar(0.0, width);
+    }
+    progress_bar(value as f64 / maximum as f64 * 100.0, width)
 }
 
 fn output_dashboard(

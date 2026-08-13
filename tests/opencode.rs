@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ai_monitor::model::Usage;
-use ai_monitor::opencode::{INDEX_NAME, OpenCodeProvider, discover_db_path};
+use ai_monitor::opencode::{INDEX_NAME, OpenCodeProvider, UsagePeriod, discover_db_path};
 use chrono::{Duration, Local, TimeZone};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -295,6 +295,51 @@ fn aggregates_assistant_usage_and_filters_local_days() {
     assert_eq!(anthropic.usage.cache_read_tokens, 1);
     assert_eq!(anthropic.usage.cache_write_tokens, 6);
     assert_eq!(anthropic.usage.cost_usd, 2.0);
+}
+
+#[test]
+fn supports_today_yesterday_and_thirty_day_periods() {
+    let fixture = Fixture::new();
+    fixture.add_session("s1", "project-a", &fixture.repo);
+    fixture.add_message("today", "s1", 0, current_message(1, 2, 0.1));
+    fixture.add_message("yesterday", "s1", 1, current_message(3, 4, 0.2));
+    fixture.add_message("older", "s1", 29, current_message(5, 6, 0.3));
+    fixture.add_message("outside", "s1", 30, current_message(7, 8, 0.4));
+
+    let provider = fixture.provider();
+    let today = provider
+        .usage_period(UsagePeriod::Today, true, None)
+        .expect("today usage");
+    assert_eq!(
+        today.rows.iter().map(|row| row.usage.messages).sum::<u64>(),
+        1
+    );
+    assert_eq!(today.start_day, today.end_day);
+
+    let yesterday = provider
+        .usage_period(UsagePeriod::Yesterday, true, None)
+        .expect("yesterday usage");
+    assert_eq!(
+        yesterday
+            .rows
+            .iter()
+            .map(|row| row.usage.messages)
+            .sum::<u64>(),
+        1
+    );
+    assert_eq!(yesterday.start_day, yesterday.end_day);
+
+    let thirty_days = provider
+        .usage_period(UsagePeriod::LastDays(30), true, None)
+        .expect("thirty-day usage");
+    assert_eq!(
+        thirty_days
+            .rows
+            .iter()
+            .map(|row| row.usage.messages)
+            .sum::<u64>(),
+        3
+    );
 }
 
 #[test]
