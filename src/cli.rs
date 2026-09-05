@@ -1,0 +1,1883 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::fs;
+use std::io::IsTerminal;
+use std::ops::AddAssign;
+use std::path::PathBuf;
+use std::process::Command;
+
+use ai_monitor::codex::{
+    self, LimitWindow, Profile, ProfileStore, ResetCredit, ResetCredits, Snapshot,
+    detailed_credits, expiring, fetch,
+};
+use ai_monitor::model::{BreakdownUsage, Usage, UsageReport};
+use ai_monitor::opencode::{DashboardReport, OpenCodeProvider, UsagePeriod, discover_db_path};
+use ai_monitor::update;
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Local, Utc};
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
+use serde::Serialize;
+use serde_json::json;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "ai-monitor",
+    version,
+    disable_version_flag = true,
+    about = "Unified local usage monitor for AI coding tools"
+)]
+struct Cli {
+    #[arg(
+        short = 'v',
+        long = "version",
+        action = ArgAction::Version,
+        help = "Print version"
+    )]
+    version: Option<bool>,
+    #[arg(long, value_enum, default_value_t, global = true)]
+    format: OutputFormat,
+    #[arg(long, value_enum, default_value_t, global = true)]
+    color: ColorMode,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Args)]
+struct PrivateApiOptions {
+    /// Skip the private reset-credit endpoint.
+    #[arg(long)]
+    no_private_api: bool,
+    /// Deprecated compatibility flag; private lookup is enabled by default.
+    #[arg(long, hide = true)]
+    allow_private_api: bool,
+}
+
+impl PrivateApiOptions {
+    fn enabled(&self) -> bool {
+        self.allow_private_api || !self.no_private_api
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OutputFormat {
+    #[default]
+    Terminal,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum UsageRange {
+    Today,
+    Yesterday,
+    #[value(name = "30-days")]
+    ThirtyDays,
+}
+
+impl UsageRange {
+    fn period(self) -> UsagePeriod {
+        match self {
+            Self::Today => UsagePeriod::Today,
+            Self::Yesterday => UsagePeriod::Yesterday,
+            Self::ThirtyDays => UsagePeriod::LastDays(30),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::ThirtyDays => "30 days",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UsageRangeOptions {
+    days: u32,
+    range: Option<UsageRange>,
+}
+
+impl UsageRangeOptions {
+    fn period(self) -> UsagePeriod {
+        self.range
+            .map(UsageRange::period)
+            .unwrap_or(UsagePeriod::LastDays(self.days))
+    }
+
+    fn label(self) -> String {
+        self.range
+            .map(|range| range.label().to_owned())
+            .unwrap_or_else(|| format!("last {} days", self.days))
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Show Codex limits and OpenCode usage together.
+    Overview {
+        #[arg(short, long, default_value_t = 7)]
+        days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
+    },
+    /// Inspect Codex accounts and subscription limits.
+    Codex {
+        #[command(subcommand)]
+        command: CodexCommands,
+    },
+    /// Analyze local OpenCode usage.
+    Opencode {
+        #[command(subcommand)]
+        command: OpenCodeCommands,
+    },
+    /// Check local provider dependencies and storage.
+    Doctor,
+    /// Check for and install the latest GitHub Release.
+    Update {
+        /// Only check the latest release without replacing the binary.
+        #[arg(long)]
+        check: bool,
+        /// Replace the current binary without asking for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// Reinstall even when the current version is already current.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Generate or install shell completion scripts.
+    Completion {
+        shell: Shell,
+        /// Install the completion file into the user's shell completion directory.
+        #[arg(long)]
+        install: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexCommands {
+    /// List isolated Codex profiles.
+    Profiles,
+    /// Set the default profile.
+    Default { name: String },
+    /// Log in through the official Codex CLI.
+    Login {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show one profile's account and rate limits.
+    Usage {
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
+    },
+    /// Show reset credits. Private lookup is enabled by default.
+    Credits {
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
+    },
+    /// Find reset credits expiring soon.
+    Expiring {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
+    },
+    /// Show all profiles and limits.
+    All {
+        #[command(flatten)]
+        private_api: PrivateApiOptions,
+    },
+    /// Run Codex with an isolated profile.
+    Run {
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Clear credentials through the official Codex CLI.
+    Logout {
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OpenCodeCommands {
+    /// Summarize usage by day, provider, and model.
+    Usage {
+        #[arg(short, long, default_value_t = 7)]
+        days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        include_cache: bool,
+        #[arg(long, default_value_t = 10)]
+        top_models: usize,
+    },
+    /// Show project, agent, subagent, token, and call-count breakdowns.
+    Dashboard {
+        #[arg(short, long, default_value_t = 7)]
+        days: u32,
+        /// Use a preset period; when set, this takes precedence over --days.
+        #[arg(long, value_enum)]
+        range: Option<UsageRange>,
+        #[arg(long)]
+        all_projects: bool,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        include_cache: bool,
+        #[arg(long, default_value_t = 10)]
+        top_projects: usize,
+        #[arg(long, default_value_t = 10)]
+        top_agents: usize,
+        #[arg(long, default_value_t = 10)]
+        top_relationships: usize,
+    },
+    /// Manage the optional all-project time index.
+    Optimize {
+        #[command(subcommand)]
+        action: OptimizeAction,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OptimizeAction {
+    /// Check whether the optional index exists.
+    Status,
+    /// Create an index in the OpenCode database.
+    Create {
+        /// Confirm modification of the third-party database.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove ai-monitor's index from the OpenCode database.
+    Remove {
+        /// Confirm modification of the third-party database.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Serialize)]
+struct ProfileResult {
+    profile: String,
+    authenticated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot: Option<Snapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credit_error: Option<String>,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
+    let cli = Cli::parse_from(compatibility_args());
+    match cli.command {
+        Commands::Overview {
+            days,
+            range,
+            all_projects,
+            project,
+            db,
+            private_api,
+        } => run_overview(
+            cli.format,
+            cli.color,
+            UsageRangeOptions { days, range },
+            all_projects,
+            project,
+            db,
+            private_api.enabled(),
+        ),
+        Commands::Codex { command } => run_codex(cli.format, cli.color, command),
+        Commands::Opencode { command } => run_opencode(cli.format, command),
+        Commands::Doctor => run_doctor(cli.format),
+        Commands::Update { check, yes, force } => run_update(cli.format, check, yes, force),
+        Commands::Completion { shell, install } => {
+            if install {
+                return install_completion(shell);
+            }
+            generate(
+                shell,
+                &mut Cli::command(),
+                "ai-monitor",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+    }
+}
+
+fn install_completion(shell: Shell) -> Result<()> {
+    let (directory, filename) = completion_destination(shell)?;
+    fs::create_dir_all(&directory).context("could not create completion directory")?;
+    let path = directory.join(filename);
+    let mut script = Vec::new();
+    generate(shell, &mut Cli::command(), "ai-monitor", &mut script);
+    atomic_write(&path, &script).context("could not install completion script")?;
+
+    let backup = if matches!(shell, Shell::Zsh) {
+        ensure_zsh_completion_path()?
+    } else {
+        None
+    };
+    println!("Installed {shell:?} completion: {}", path.display());
+    if let Some(backup) = backup {
+        println!("Backed up shell configuration: {}", backup.display());
+    }
+    println!("Restart the shell or run `rehash` to activate completion.");
+    Ok(())
+}
+
+fn completion_destination(shell: Shell) -> Result<(PathBuf, String)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let xdg_data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    Ok(match shell {
+        Shell::Zsh => (home.join(".zsh/completions"), "_ai-monitor".to_owned()),
+        Shell::Bash => (
+            xdg_data.join("bash-completion/completions"),
+            "ai-monitor".to_owned(),
+        ),
+        Shell::Fish => (
+            xdg_config.join("fish/completions"),
+            "ai-monitor.fish".to_owned(),
+        ),
+        Shell::PowerShell => (
+            home.join("Documents/PowerShell/Completions"),
+            "ai-monitor.ps1".to_owned(),
+        ),
+        Shell::Elvish => (xdg_config.join("elvish/lib"), "ai-monitor.elv".to_owned()),
+        _ => bail!("completion installation is not supported for this shell"),
+    })
+}
+
+fn ensure_zsh_completion_path() -> Result<Option<PathBuf>> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")?;
+    let path = home.join(".zshrc");
+    let mut contents = if path.exists() {
+        fs::read_to_string(&path).context("could not read .zshrc")?
+    } else {
+        String::new()
+    };
+    let completion_path = "fpath=(\"$HOME/.zsh/completions\" $fpath)";
+    let needs_fpath = !contents.contains(completion_path);
+    let needs_compinit = !contents.contains("compinit");
+    if !needs_fpath && !needs_compinit {
+        return Ok(None);
+    }
+
+    let backup = if path.exists() {
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+        let backup = home.join(format!(".zshrc.backup-{timestamp}"));
+        fs::copy(&path, &backup).context("could not back up .zshrc")?;
+        Some(backup)
+    } else {
+        None
+    };
+    if !contents.ends_with('\n') && !contents.is_empty() {
+        contents.push('\n');
+    }
+    contents.push_str("\n# ai-monitor shell completion\n");
+    if needs_fpath {
+        contents.push_str(completion_path);
+        contents.push('\n');
+    }
+    if needs_compinit {
+        contents.push_str("autoload -Uz compinit\ncompinit\n");
+    }
+    atomic_write(&path, contents.as_bytes()).context("could not update .zshrc")?;
+    Ok(backup)
+}
+
+fn atomic_write(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, contents)?;
+    fs::rename(temporary, path)
+}
+
+fn run_update(format: OutputFormat, check_only: bool, yes: bool, force: bool) -> Result<()> {
+    let info = update::check()?;
+    let available = force || info.latest > info.current;
+    if matches!(format, OutputFormat::Json) {
+        if !check_only && available && !yes {
+            bail!("JSON updates require --yes");
+        }
+        if check_only || !available {
+            return output_value(
+                format,
+                &json!({
+                    "current": info.current.to_string(),
+                    "latest": info.latest.to_string(),
+                    "latest_tag": info.latest_tag,
+                    "update_available": available,
+                    "updated": false,
+                }),
+            );
+        }
+    } else if !available {
+        println!("ai-monitor {} is already up to date.", info.current);
+        return Ok(());
+    } else if check_only {
+        println!(
+            "Update available: {} -> {} ({})",
+            info.current, info.latest, info.latest_tag
+        );
+        return Ok(());
+    } else if !yes {
+        if !std::io::stdin().is_terminal() {
+            bail!("non-interactive updates require --yes");
+        }
+        println!(
+            "Update ai-monitor {} -> {}? [y/N]",
+            info.current, info.latest
+        );
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .context("could not read update confirmation")?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Update cancelled.");
+            return Ok(());
+        }
+    }
+
+    let installed = update::install_latest()?;
+    if matches!(format, OutputFormat::Json) {
+        output_value(
+            format,
+            &json!({
+                "current": installed.current.to_string(),
+                "latest": installed.latest.to_string(),
+                "latest_tag": installed.latest_tag,
+                "update_available": true,
+                "updated": true,
+            }),
+        )
+    } else {
+        println!(
+            "Updated ai-monitor {} -> {}. Restart the command to use the new binary.",
+            installed.current, installed.latest
+        );
+        Ok(())
+    }
+}
+
+fn compatibility_args() -> Vec<OsString> {
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    let executable = args
+        .first()
+        .and_then(|path| std::path::Path::new(path).file_stem())
+        .and_then(|name| name.to_str());
+    match executable {
+        Some("chatgpt-status") => args.insert(1, "codex".into()),
+        Some("opencode-daily-usage") => {
+            args.insert(1, "opencode".into());
+            args.insert(2, "usage".into());
+        }
+        _ => {}
+    }
+    args
+}
+
+fn provider(db: Option<PathBuf>) -> OpenCodeProvider {
+    db.map(OpenCodeProvider::with_db_path).unwrap_or_default()
+}
+
+fn run_opencode(format: OutputFormat, command: OpenCodeCommands) -> Result<()> {
+    match command {
+        OpenCodeCommands::Usage {
+            days,
+            range,
+            all_projects,
+            project,
+            db,
+            include_cache,
+            top_models,
+        } => {
+            let provider = provider(db);
+            let report = provider
+                .usage_period(
+                    UsageRangeOptions { days, range }.period(),
+                    all_projects,
+                    project.as_deref(),
+                )
+                .context("failed to read OpenCode usage")?;
+            if all_projects && !provider.index_status().unwrap_or(false) {
+                eprintln!(
+                    "warning: all-project queries may scan the entire database; run `ai-monitor opencode optimize create --yes` to add the optional time index"
+                );
+            }
+            let summary = if matches!(format, OutputFormat::Terminal) {
+                Some(
+                    provider
+                        .usage_period(UsagePeriod::LastDays(30), all_projects, project.as_deref())
+                        .context("failed to read OpenCode usage summary")?,
+                )
+            } else {
+                None
+            };
+            output_usage(
+                format,
+                &report,
+                summary.as_ref(),
+                include_cache,
+                top_models,
+                UsageRangeOptions { days, range }.label(),
+            )
+        }
+        OpenCodeCommands::Dashboard {
+            days,
+            range,
+            all_projects,
+            project,
+            db,
+            include_cache,
+            top_projects,
+            top_agents,
+            top_relationships,
+        } => {
+            let provider = provider(db);
+            let report = provider
+                .dashboard_period(
+                    UsageRangeOptions { days, range }.period(),
+                    all_projects,
+                    project.as_deref(),
+                )
+                .context("failed to read OpenCode dashboard")?;
+            if all_projects && !provider.index_status().unwrap_or(false) {
+                eprintln!(
+                    "warning: all-project dashboard queries may scan the entire message table; run `ai-monitor opencode optimize create --yes` to add the optional time index"
+                );
+            }
+            output_dashboard(
+                format,
+                &report,
+                include_cache,
+                top_projects,
+                top_agents,
+                top_relationships,
+            )
+        }
+        OpenCodeCommands::Optimize { action, db } => {
+            let provider = provider(db);
+            match action {
+                OptimizeAction::Status => {
+                    let exists = provider.index_status().context("failed to inspect index")?;
+                    output_value(format, &json!({"installed": exists}))?;
+                    if matches!(format, OutputFormat::Terminal) {
+                        println!(
+                            "OpenCode time index: {}",
+                            if exists { "installed" } else { "not installed" }
+                        );
+                    }
+                }
+                OptimizeAction::Create { yes } => {
+                    require_confirmation(yes)?;
+                    provider.create_index().context("failed to create index")?;
+                    if matches!(format, OutputFormat::Json) {
+                        output_value(format, &json!({"installed": true, "changed": true}))?;
+                    } else {
+                        println!("OpenCode time index created.");
+                    }
+                }
+                OptimizeAction::Remove { yes } => {
+                    require_confirmation(yes)?;
+                    provider.remove_index().context("failed to remove index")?;
+                    if matches!(format, OutputFormat::Json) {
+                        output_value(format, &json!({"installed": false, "changed": true}))?;
+                    } else {
+                        println!("OpenCode time index removed.");
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn require_confirmation(yes: bool) -> Result<()> {
+    if !yes {
+        bail!("this modifies the OpenCode database; rerun with --yes after making a backup")
+    }
+    Ok(())
+}
+
+fn run_codex(format: OutputFormat, color: ColorMode, command: CodexCommands) -> Result<()> {
+    let store = ProfileStore::from_env().context("failed to open Codex profile storage")?;
+    match command {
+        CodexCommands::Profiles => {
+            let profiles = store.list()?;
+            if matches!(format, OutputFormat::Json) {
+                output_value(format, &profiles)?;
+            } else {
+                let default = store.default_name()?;
+                println!("DEFAULT  PROFILE  AUTH");
+                for profile in profiles {
+                    println!(
+                        "{:<7}  {:<7}  {}",
+                        if default.as_deref() == Some(&profile.name) {
+                            "*"
+                        } else {
+                            ""
+                        },
+                        profile.name,
+                        if profile.authenticated {
+                            "ready"
+                        } else {
+                            "not logged in"
+                        }
+                    );
+                }
+            }
+        }
+        CodexCommands::Default { name } => {
+            store.set_default(&name)?;
+            println!("Default Codex profile set to {name}.");
+        }
+        CodexCommands::Login { name, force } => {
+            let status = codex::login(&store, &name, force)?;
+            if !status.success() {
+                bail!("Codex login exited with {status}");
+            }
+            if store.default_name()?.is_none() {
+                store.set_default(&name)?;
+            }
+        }
+        CodexCommands::Usage {
+            profile,
+            private_api,
+        } => {
+            if let Some(name) = profile.as_deref() {
+                store.resolve(Some(name))?;
+            }
+            let use_private_api = private_api.enabled();
+            let queried_at = Local::now();
+            let results = fetch_all(&store, use_private_api, profile.as_deref())?;
+            output_codex_dashboard(
+                format,
+                &results,
+                profile.as_deref(),
+                color,
+                use_private_api,
+                queried_at,
+            )?;
+        }
+        CodexCommands::Credits {
+            profile,
+            private_api,
+        } => {
+            let profile = store.resolve(profile.as_deref())?;
+            let snapshot = fetch(&profile)?;
+            let credits = detailed_credits(&profile, &snapshot, private_api.enabled())?;
+            output_credits(format, &profile.name, &credits)?;
+        }
+        CodexCommands::Expiring {
+            profile,
+            days,
+            private_api,
+        } => {
+            let use_private_api = private_api.enabled();
+            let profiles = match profile {
+                Some(name) => vec![store.resolve(Some(&name))?],
+                None => store.list()?,
+            };
+            let mut results = Vec::new();
+            let mut errors = Vec::new();
+            for profile in profiles {
+                match fetch(&profile) {
+                    Ok(snapshot) => {
+                        let credits = match detailed_credits(&profile, &snapshot, use_private_api) {
+                            Ok(credits) => credits,
+                            Err(error) => {
+                                errors.push(format!("{}: {error}", profile.name));
+                                continue;
+                            }
+                        };
+                        if credits.credits.is_none() {
+                            errors.push(format!(
+                                "{}: reset-credit details unavailable{}",
+                                profile.name,
+                                if use_private_api {
+                                    ""
+                                } else {
+                                    "; retry without --no-private-api to query the private endpoint"
+                                }
+                            ));
+                            continue;
+                        }
+                        for credit in expiring(&credits, days, Utc::now()) {
+                            results.push(json!({"profile": profile.name, "credit": credit}));
+                        }
+                    }
+                    Err(error) => errors.push(format!("{}: {error}", profile.name)),
+                }
+            }
+            if matches!(format, OutputFormat::Json) {
+                output_value(
+                    format,
+                    &json!({"days": days, "expiring": results, "errors": errors}),
+                )?;
+            } else {
+                for item in &results {
+                    println!(
+                        "{}  {}",
+                        item["profile"].as_str().unwrap_or("unknown"),
+                        item["credit"]["expires_at"].as_str().unwrap_or("unknown")
+                    );
+                }
+                if results.is_empty() && errors.is_empty() {
+                    println!("No reset credits expire within {days} days.");
+                }
+                for error in errors {
+                    eprintln!("warning: {error}");
+                }
+            }
+        }
+        CodexCommands::All { private_api } => {
+            let use_private_api = private_api.enabled();
+            let queried_at = Local::now();
+            let results = fetch_all(&store, use_private_api, None)?;
+            output_codex_dashboard(format, &results, None, color, use_private_api, queried_at)?;
+        }
+        CodexCommands::Run { profile, args } => {
+            let profile = store.resolve(profile.as_deref())?;
+            let status = codex::run(&profile, &args)?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+        CodexCommands::Logout { profile } => {
+            let profile = store.resolve(profile.as_deref())?;
+            let status = codex::logout(&profile)?;
+            if !status.success() {
+                bail!("Codex logout exited with {status}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fetch_all(
+    store: &ProfileStore,
+    use_private_api: bool,
+    private_profile: Option<&str>,
+) -> Result<Vec<ProfileResult>> {
+    Ok(store
+        .list()?
+        .into_iter()
+        .map(|profile| {
+            let allow_private_for_profile = use_private_api
+                && private_profile
+                    .map(|selected| selected == profile.name)
+                    .unwrap_or(true);
+            fetch_profile(&profile, allow_private_for_profile)
+        })
+        .collect())
+}
+
+fn fetch_profile(profile: &Profile, use_private_api: bool) -> ProfileResult {
+    if !profile.authenticated {
+        return ProfileResult {
+            profile: profile.name.clone(),
+            authenticated: false,
+            snapshot: None,
+            error: None,
+            credit_error: None,
+        };
+    }
+
+    match fetch(profile) {
+        Ok(mut snapshot) => {
+            let mut credit_error = None;
+            if use_private_api && snapshot.reset_credits.credits.is_none() {
+                match detailed_credits(profile, &snapshot, true) {
+                    Ok(credits) => snapshot.reset_credits = credits,
+                    Err(error) => credit_error = Some(error.to_string()),
+                }
+            }
+            ProfileResult {
+                profile: profile.name.clone(),
+                authenticated: true,
+                snapshot: Some(snapshot),
+                error: None,
+                credit_error,
+            }
+        }
+        Err(error) => ProfileResult {
+            profile: profile.name.clone(),
+            authenticated: true,
+            snapshot: None,
+            error: Some(error.to_string()),
+            credit_error: None,
+        },
+    }
+}
+
+fn run_overview(
+    format: OutputFormat,
+    color: ColorMode,
+    range_options: UsageRangeOptions,
+    all_projects: bool,
+    project: Option<PathBuf>,
+    db: Option<PathBuf>,
+    use_private_api: bool,
+) -> Result<()> {
+    let provider = provider(db);
+    let report = provider
+        .usage_period(range_options.period(), all_projects, project.as_deref())
+        .context("failed to read OpenCode usage")?;
+    let codex_queried_at = Local::now();
+    let codex = ProfileStore::from_env()
+        .map_err(anyhow::Error::from)
+        .and_then(|store| fetch_all(&store, use_private_api, None))
+        .unwrap_or_else(|error| {
+            vec![ProfileResult {
+                profile: "codex".to_owned(),
+                authenticated: false,
+                snapshot: None,
+                error: Some(error.to_string()),
+                credit_error: None,
+            }]
+        });
+    if matches!(format, OutputFormat::Json) {
+        output_value(format, &json!({"opencode": report, "codex": codex}))
+    } else {
+        println!("CODEX");
+        output_codex_dashboard(
+            OutputFormat::Terminal,
+            &codex,
+            None,
+            color,
+            use_private_api,
+            codex_queried_at,
+        )?;
+        println!("\nOPENCODE");
+        let summary = provider
+            .usage_period(UsagePeriod::LastDays(30), all_projects, project.as_deref())
+            .context("failed to read OpenCode usage summary")?;
+        output_usage(
+            format,
+            &report,
+            Some(&summary),
+            false,
+            10,
+            range_options.label(),
+        )
+    }
+}
+
+fn run_doctor(format: OutputFormat) -> Result<()> {
+    let codex_version = command_version("codex");
+    let opencode_version = command_version("opencode");
+    let profile_home = ProfileStore::from_env().map(|store| store.root().to_path_buf());
+    let database = discover_db_path(None);
+    let value = json!({
+        "codex": codex_version,
+        "opencode": opencode_version,
+        "profile_home": profile_home.ok(),
+        "opencode_database": database.ok(),
+    });
+    if matches!(format, OutputFormat::Json) {
+        output_value(format, &value)
+    } else {
+        println!(
+            "Codex:   {}",
+            value["codex"].as_str().unwrap_or("not found")
+        );
+        println!(
+            "OpenCode: {}",
+            value["opencode"].as_str().unwrap_or("not found")
+        );
+        println!(
+            "Profiles: {}",
+            value["profile_home"].as_str().unwrap_or("unavailable")
+        );
+        println!(
+            "Database: {}",
+            value["opencode_database"].as_str().unwrap_or("unavailable")
+        );
+        Ok(())
+    }
+}
+
+fn command_version(binary: &str) -> Option<String> {
+    let output = Command::new(binary).arg("--version").output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn output_value(format: OutputFormat, value: &impl Serialize) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+fn output_usage(
+    format: OutputFormat,
+    report: &UsageReport,
+    summary: Option<&UsageReport>,
+    include_cache: bool,
+    top_models: usize,
+    period: String,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(format, report);
+    }
+    println!("Range: {} to {}", report.start_day, report.end_day);
+    println!("Scope: {}", report.scope);
+    println!("Period: {period}");
+    let mut days = BTreeMap::<String, Usage>::new();
+    let mut models = BTreeMap::<String, Usage>::new();
+    let mut providers = BTreeMap::<String, Usage>::new();
+    for row in &report.rows {
+        days.entry(row.day.clone())
+            .or_default()
+            .add_assign(&row.usage);
+        models
+            .entry(format!("{}/{}", row.provider, row.model))
+            .or_default()
+            .add_assign(&row.usage);
+        providers
+            .entry(row.provider.clone())
+            .or_default()
+            .add_assign(&row.usage);
+    }
+
+    render_usage_summary(summary.unwrap_or(report), report, include_cache);
+    render_provider_costs(&providers);
+    render_usage_trend(&days, include_cache);
+
+    println!("\nDAILY USAGE");
+    println!("DATE        TOKENS       MSGS       COST");
+    for (day, usage) in days {
+        let tokens = if include_cache {
+            usage.all_tokens()
+        } else {
+            usage.active_tokens()
+        };
+        println!(
+            "{day}  {:>10}  {:>9}  ${:>9.4}",
+            compact(tokens),
+            usage.messages,
+            usage.cost_usd
+        );
+    }
+    let mut models = models.into_iter().collect::<Vec<_>>();
+    models.sort_by_key(|(_, usage)| {
+        std::cmp::Reverse(if include_cache {
+            usage.all_tokens()
+        } else {
+            usage.active_tokens()
+        })
+    });
+    if top_models > 0 {
+        models.truncate(top_models);
+    }
+    println!("\nMODEL RANKING");
+    println!("MODEL                                      TOKENS       MSGS       COST");
+    for (model, usage) in models {
+        let tokens = if include_cache {
+            usage.all_tokens()
+        } else {
+            usage.active_tokens()
+        };
+        println!(
+            "{:<40}  {:>10}  {:>9}  ${:>9.4}",
+            truncate(&model, 40),
+            compact(tokens),
+            usage.messages,
+            usage.cost_usd
+        );
+    }
+    Ok(())
+}
+
+fn aggregate_report(report: &UsageReport) -> Usage {
+    report.rows.iter().fold(Usage::default(), |mut total, row| {
+        total.add_assign(&row.usage);
+        total
+    })
+}
+
+fn render_usage_summary(summary: &UsageReport, selected: &UsageReport, include_cache: bool) {
+    let selected_total = aggregate_report(selected);
+    let summary_by_day =
+        summary
+            .rows
+            .iter()
+            .fold(BTreeMap::<String, Usage>::new(), |mut totals, row| {
+                totals
+                    .entry(row.day.clone())
+                    .or_default()
+                    .add_assign(&row.usage);
+                totals
+            });
+    let today = summary_by_day.get(&summary.end_day);
+    let yesterday = chrono::NaiveDate::parse_from_str(&summary.end_day, "%Y-%m-%d")
+        .ok()
+        .and_then(|day| day.pred_opt())
+        .and_then(|day| summary_by_day.get(&day.to_string()));
+    let last_30 = (!summary.rows.is_empty()).then(|| aggregate_report(summary));
+    let selected_total = (!selected.rows.is_empty()).then_some(selected_total);
+
+    println!("\nCOST & TOKEN SUMMARY");
+    println!("PERIOD       COST          TOKENS       MESSAGES");
+    print_summary_row("TODAY", today, include_cache);
+    print_summary_row("YESTERDAY", yesterday, include_cache);
+    print_summary_row("30 DAYS", last_30.as_ref(), include_cache);
+    print_summary_row("SELECTED", selected_total.as_ref(), include_cache);
+}
+
+fn print_summary_row(label: &str, usage: Option<&Usage>, include_cache: bool) {
+    let Some(usage) = usage else {
+        println!("{label:<11} unavailable (no usage data)");
+        return;
+    };
+    println!(
+        "{label:<11} ${:>10.4}  {:>11}  {:>8}",
+        usage.cost_usd,
+        compact(usage_tokens(usage, include_cache)),
+        usage.messages
+    );
+}
+
+fn render_provider_costs(providers: &BTreeMap<String, Usage>) {
+    println!("\nCOST BY PROVIDER");
+    if providers.is_empty() {
+        println!("No provider cost data available for this range.");
+        return;
+    }
+    let total = providers.values().map(|usage| usage.cost_usd).sum::<f64>();
+    let mut rows = providers.iter().collect::<Vec<_>>();
+    rows.sort_by(|(_, left), (_, right)| {
+        right
+            .cost_usd
+            .partial_cmp(&left.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    println!("PROVIDER                 COST          SHARE  DISTRIBUTION");
+    for (provider, usage) in rows {
+        let share = if total > 0.0 {
+            usage.cost_usd / total * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{:<22}  ${:>10.4}  {:>6.1}%  {}",
+            truncate(provider, 22),
+            usage.cost_usd,
+            share,
+            progress_bar(share, 18)
+        );
+    }
+}
+
+fn render_usage_trend(days: &BTreeMap<String, Usage>, include_cache: bool) {
+    println!("\nUSAGE TREND");
+    if days.is_empty() {
+        println!("No usage data available for this range.");
+        return;
+    }
+    let maximum = days
+        .values()
+        .map(|usage| usage_tokens(usage, include_cache))
+        .max()
+        .unwrap_or_default();
+    for (day, usage) in days {
+        let tokens = usage_tokens(usage, include_cache);
+        println!(
+            "{}  {} {:>8}  ${:.4}",
+            day,
+            progress_bar_ratio(tokens, maximum, 24),
+            compact(tokens),
+            usage.cost_usd
+        );
+    }
+}
+
+fn usage_tokens(usage: &Usage, include_cache: bool) -> u64 {
+    if include_cache {
+        usage.all_tokens()
+    } else {
+        usage.active_tokens()
+    }
+}
+
+fn progress_bar_ratio(value: u64, maximum: u64, width: usize) -> String {
+    if maximum == 0 {
+        return progress_bar(0.0, width);
+    }
+    progress_bar(value as f64 / maximum as f64 * 100.0, width)
+}
+
+fn output_dashboard(
+    format: OutputFormat,
+    report: &DashboardReport,
+    include_cache: bool,
+    top_projects: usize,
+    top_agents: usize,
+    top_relationships: usize,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(format, report);
+    }
+
+    let total_tokens = dashboard_tokens(&report.totals, include_cache);
+    println!("OPENCODE USAGE DASHBOARD");
+    println!("Range: {} to {}", report.start_day, report.end_day);
+    println!("Scope: {}", report.scope);
+    println!(
+        "Total: {} calls · {} sessions · {} tokens · {} projects",
+        report.totals.calls,
+        report.totals.sessions,
+        compact(total_tokens),
+        report.projects.len()
+    );
+
+    let project_count = limited_count(report.projects.len(), top_projects);
+    println!("\nPROJECT OVERVIEW");
+    println!("PROJECT                         CALLS  SESSIONS      TOKENS   SHARE");
+    for project in report.projects.iter().take(project_count) {
+        let tokens = dashboard_tokens(&project.usage, include_cache);
+        println!(
+            "{:<30} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+            truncate(&project.name, 30),
+            project.usage.calls,
+            project.usage.sessions,
+            compact(tokens),
+            dashboard_share(tokens, total_tokens),
+        );
+    }
+    if project_count < report.projects.len() {
+        println!("Showing top {project_count} projects; use --top-projects 0 for all.");
+    }
+
+    println!("\nAGENT BREAKDOWN");
+    for project in report.projects.iter().take(project_count) {
+        println!("\n{} ({})", project.name, project.path);
+        println!("AGENT / SUBAGENT                 TYPE       CALLS  SESSIONS      TOKENS   SHARE");
+        let agent_count = limited_count(project.agents.len(), top_agents);
+        let project_tokens = dashboard_tokens(&project.usage, include_cache);
+        for agent in project.agents.iter().take(agent_count) {
+            let tokens = dashboard_tokens(&agent.usage, include_cache);
+            println!(
+                "{:<32} {:<9} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+                truncate(&agent.name, 32),
+                agent.kind,
+                agent.usage.calls,
+                agent.usage.sessions,
+                compact(tokens),
+                dashboard_share(tokens, project_tokens),
+            );
+        }
+        if agent_count < project.agents.len() {
+            println!("Showing top {agent_count} agents; use --top-agents 0 for all.");
+        }
+    }
+
+    println!("\nPRIMARY -> SUBAGENT RELATIONSHIPS");
+    let mut printed_relationships = false;
+    for project in report.projects.iter().take(project_count) {
+        if project.relationships.is_empty() {
+            continue;
+        }
+        printed_relationships = true;
+        println!("\n{} ({})", project.name, project.path);
+        println!(
+            "PARENT                         SUBAGENT                 SPAWNS     CALLS      TOKENS   SHARE"
+        );
+        let relationship_count = limited_count(project.relationships.len(), top_relationships);
+        let project_tokens = dashboard_tokens(&project.usage, include_cache);
+        for relationship in project.relationships.iter().take(relationship_count) {
+            let tokens = dashboard_tokens(&relationship.usage, include_cache);
+            println!(
+                "{:<30} {:<24} {:>7}  {:>8}  {:>10}  {:>6.1}%",
+                truncate(&relationship.parent, 30),
+                truncate(&relationship.subagent, 24),
+                relationship.usage.sessions,
+                relationship.usage.calls,
+                compact(tokens),
+                dashboard_share(tokens, project_tokens),
+            );
+        }
+        if relationship_count < project.relationships.len() {
+            println!(
+                "Showing top {relationship_count} relationships; use --top-relationships 0 for all."
+            );
+        }
+    }
+    if !printed_relationships {
+        println!("No parent-subagent session relationships found in this range.");
+    }
+    Ok(())
+}
+
+fn dashboard_tokens(usage: &BreakdownUsage, include_cache: bool) -> u64 {
+    if include_cache {
+        usage.all_tokens()
+    } else {
+        usage.active_tokens()
+    }
+}
+
+fn dashboard_share(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64 / total as f64 * 100.0
+    }
+}
+
+fn limited_count(total: usize, limit: usize) -> usize {
+    if limit == 0 { total } else { total.min(limit) }
+}
+
+struct Theme {
+    enabled: bool,
+}
+
+impl Theme {
+    fn new(mode: ColorMode) -> Self {
+        let enabled = match mode {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => {
+                std::io::stdout().is_terminal()
+                    && std::env::var_os("NO_COLOR").is_none()
+                    && std::env::var("TERM").as_deref() != Ok("dumb")
+            }
+        };
+        Self { enabled }
+    }
+
+    fn paint(&self, text: impl AsRef<str>, code: &str) -> String {
+        let text = text.as_ref();
+        if self.enabled {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    }
+}
+
+fn ui_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(96)
+        .saturating_sub(4)
+        .clamp(76, 100)
+}
+
+fn visible_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut escape = false;
+    for character in value.chars() {
+        if escape {
+            if character == 'm' {
+                escape = false;
+            }
+        } else if character == '\x1b' {
+            escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let padding = width.saturating_sub(visible_width(value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn styled_cell(theme: &Theme, value: &str, width: usize, code: &str, right: bool) -> String {
+    let value = truncate(value, width);
+    let padded = if right {
+        format!("{value:>width$}")
+    } else {
+        format!("{value:<width$}")
+    };
+    theme.paint(padded, code)
+}
+
+const BOLD: &str = "1";
+const DIM: &str = "2";
+const RED: &str = "31";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const CYAN: &str = "36";
+
+fn output_codex_dashboard(
+    format: OutputFormat,
+    results: &[ProfileResult],
+    selected: Option<&str>,
+    color: ColorMode,
+    use_private_api: bool,
+    queried_at: DateTime<Local>,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(
+            format,
+            &json!({
+                "queried_at": queried_at.to_rfc3339(),
+                "account_count": results.len(),
+                "selected_profile": selected,
+                "accounts": results,
+            }),
+        );
+    }
+
+    let theme = Theme::new(color);
+    let width = ui_width();
+    let ready = results
+        .iter()
+        .filter(|result| result.snapshot.is_some())
+        .count();
+    println!();
+    println!(
+        "╭{}╮",
+        pad_visible(&theme.paint("─ CODEX USAGE DASHBOARD ", BOLD), width)
+    );
+    println!(
+        "│{}│",
+        pad_visible(
+            &theme.paint(
+                format!(
+                    " Accounts: {} total · {} ready · {}",
+                    results.len(),
+                    ready,
+                    selected
+                        .map(|name| format!("selected: {name}"))
+                        .unwrap_or_else(|| "all accounts".to_owned())
+                ),
+                CYAN,
+            ),
+            width
+        )
+    );
+    println!(
+        "│{}│",
+        pad_visible(
+            &theme.paint(
+                format!(" Queried: {}", queried_at.format("%Y-%m-%d %H:%M:%S %:z")),
+                DIM,
+            ),
+            width,
+        )
+    );
+    println!("╰{}╯", "─".repeat(width));
+    println!();
+    println!("{}", theme.paint("ACCOUNT OVERVIEW", BOLD));
+    println!("  > PROFILE       STATUS       REMAINING   RESET                 CREDITS");
+    for result in results {
+        render_account_summary(&theme, result, selected);
+    }
+
+    println!();
+    println!("{}", theme.paint("ACCOUNT DETAILS", BOLD));
+    if results.is_empty() {
+        println!("  No Codex accounts found. Run `ai-monitor codex login NAME`.");
+    }
+    for result in results {
+        render_account_card(&theme, result, selected, use_private_api, width);
+    }
+
+    if !use_private_api && results.iter().any(missing_credit_details) {
+        println!();
+        println!(
+            "{}",
+            theme.paint(
+                "Note: private reset-credit lookup is disabled by --no-private-api.",
+                YELLOW,
+            )
+        );
+    }
+    Ok(())
+}
+
+fn render_account_summary(theme: &Theme, result: &ProfileResult, selected: Option<&str>) {
+    let marker = if selected == Some(result.profile.as_str()) {
+        ">"
+    } else {
+        " "
+    };
+    let name = truncate(&result.profile, 12);
+    let Some(snapshot) = &result.snapshot else {
+        let (status, status_code) = if result.authenticated {
+            ("[ERROR]", RED)
+        } else {
+            ("[LOGIN]", YELLOW)
+        };
+        println!(
+            "  {marker} {:<12} {} {} {} {}",
+            name,
+            styled_cell(theme, status, 12, status_code, false),
+            styled_cell(theme, "-", 8, DIM, true),
+            styled_cell(theme, "-", 20, DIM, false),
+            styled_cell(theme, "not ready", 18, DIM, false)
+        );
+        return;
+    };
+
+    let (usage, _) = primary_usage(snapshot);
+    let (remaining, remaining_code) = remaining_usage(usage);
+    let remaining_text = format!("{remaining:.1}%");
+    let reset = primary_limit(snapshot)
+        .and_then(|limit| limit.resets_at)
+        .map(format_reset_summary)
+        .unwrap_or_else(|| "unknown".to_owned());
+    let (credits, credits_code) = credit_count_parts(&snapshot.reset_credits);
+    println!(
+        "  {marker} {:<12} {} {} {} {}",
+        name,
+        styled_cell(theme, "[READY]", 12, GREEN, false),
+        styled_cell(theme, &remaining_text, 8, remaining_code, true),
+        styled_cell(theme, &reset, 20, DIM, false),
+        styled_cell(theme, &credits, 18, credits_code, false)
+    );
+}
+
+fn render_account_card(
+    theme: &Theme,
+    result: &ProfileResult,
+    selected: Option<&str>,
+    use_private_api: bool,
+    width: usize,
+) {
+    let selected_marker = if selected == Some(result.profile.as_str()) {
+        " <selected>"
+    } else {
+        ""
+    };
+    println!();
+    println!("  ┌{}┐", "─".repeat(width));
+    card_line(
+        theme,
+        width,
+        &theme.paint(format!(" {}{}", result.profile, selected_marker), CYAN),
+    );
+
+    let Some(snapshot) = &result.snapshot else {
+        let message = if result.authenticated {
+            result
+                .error
+                .as_deref()
+                .unwrap_or("Codex app-server unavailable")
+        } else {
+            "Not logged in"
+        };
+        card_line(theme, width, &theme.paint(format!(" {message}"), YELLOW));
+        println!("  └{}┘", "─".repeat(width));
+        return;
+    };
+
+    let account = format!(
+        "{} · {}",
+        snapshot.account.email.as_deref().unwrap_or("unknown"),
+        snapshot.account.plan_type.as_deref().unwrap_or("unknown")
+    );
+    card_line(
+        theme,
+        width,
+        &format!(" Account: {}", truncate(&account, width.saturating_sub(10))),
+    );
+    card_line(theme, width, "");
+    card_line(theme, width, &theme.paint(" RATE LIMITS", BOLD));
+    if snapshot.limits.is_empty() {
+        card_line(theme, width, "   No rate-limit window returned by Codex.");
+    }
+    for limit in &snapshot.limits {
+        let (usage, _) = limit_usage(limit);
+        let (remaining_percent, remaining_code) = remaining_usage(usage);
+        let bar = theme.paint(progress_bar(remaining_percent, 24), remaining_code);
+        let remaining = theme.paint(format!("{remaining_percent:>5.1}%"), remaining_code);
+        let reset = limit
+            .resets_at
+            .map(format_reset_time)
+            .unwrap_or_else(|| "unknown".to_owned());
+        card_line(
+            theme,
+            width,
+            &format!("   {:<9} remaining {}", limit_label(limit), remaining),
+        );
+        card_line(
+            theme,
+            width,
+            &format!("             {}  reset {}", bar, reset),
+        );
+    }
+    card_line(theme, width, "");
+    card_line(theme, width, &theme.paint(" RESET CREDITS", BOLD));
+    card_line(
+        theme,
+        width,
+        &format!(
+            "   Available: {}  Source: {}",
+            format_credit_count(theme, &snapshot.reset_credits),
+            snapshot.reset_credits.source
+        ),
+    );
+    render_credit_details(
+        theme,
+        &snapshot.reset_credits,
+        use_private_api,
+        result.credit_error.as_deref(),
+        width,
+    );
+    if let Some(error) = &snapshot.usage_error {
+        card_line(
+            theme,
+            width,
+            &format!("   Usage activity: {}", theme.paint(error, DIM)),
+        );
+    }
+    println!("  └{}┘", "─".repeat(width));
+}
+
+fn card_line(_theme: &Theme, width: usize, content: &str) {
+    println!("  │{}│", pad_visible(content, width));
+}
+
+fn render_credit_details(
+    theme: &Theme,
+    credits: &ResetCredits,
+    use_private_api: bool,
+    detail_error: Option<&str>,
+    width: usize,
+) {
+    match credits.credits.as_deref() {
+        Some(rows) => {
+            if rows.is_empty() {
+                if credits.available_count.unwrap_or(0) > 0 {
+                    card_line(
+                        theme,
+                        width,
+                        &theme.paint("   Expiry details unavailable from app-server", YELLOW),
+                    );
+                } else {
+                    card_line(theme, width, "   No reset credits currently available.");
+                }
+            } else {
+                for (index, credit) in rows.iter().enumerate() {
+                    render_credit(theme, index + 1, credit, width);
+                }
+            }
+        }
+        None => {
+            let hint = if let Some(error) = detail_error {
+                error
+            } else if use_private_api {
+                "Private credit detail lookup failed or returned no rows"
+            } else {
+                "Private credit lookup disabled by --no-private-api"
+            };
+            card_line(theme, width, &theme.paint(format!("   {hint}"), YELLOW));
+        }
+    }
+}
+
+fn render_credit(theme: &Theme, index: usize, credit: &ResetCredit, width: usize) {
+    let status = credit.status.as_deref().unwrap_or("available");
+    let status_code = if matches!(status, "active" | "available") {
+        GREEN
+    } else {
+        DIM
+    };
+    let title = truncate(credit.title.as_deref().unwrap_or("Reset credit"), 24);
+    let expires = credit
+        .expires_at
+        .map(|time| {
+            let label = format!(
+                "{} ({})",
+                time.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+                relative_time(time)
+            );
+            theme.paint(label, expiry_color(time))
+        })
+        .unwrap_or_else(|| "no expiry".to_owned());
+    card_line(
+        theme,
+        width,
+        &format!(
+            "   #{index:<2} {}  {:<24} expires {}",
+            theme.paint(status, status_code),
+            title,
+            expires
+        ),
+    );
+}
+
+fn missing_credit_details(result: &ProfileResult) -> bool {
+    result
+        .snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.reset_credits.credits.is_none())
+}
+
+fn primary_limit(snapshot: &Snapshot) -> Option<&LimitWindow> {
+    snapshot
+        .limits
+        .iter()
+        .find(|limit| limit.name == "primary")
+        .or_else(|| snapshot.limits.first())
+}
+
+fn primary_usage(snapshot: &Snapshot) -> (f64, &'static str) {
+    primary_limit(snapshot)
+        .map(limit_usage)
+        .unwrap_or((0.0, DIM))
+}
+
+fn limit_usage(limit: &LimitWindow) -> (f64, &'static str) {
+    let usage = limit.used_percent.clamp(0.0, 100.0);
+    let color = if usage >= 90.0 {
+        RED
+    } else if usage >= 75.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+    (usage, color)
+}
+
+fn remaining_usage(usage: f64) -> (f64, &'static str) {
+    let remaining = 100.0 - usage.clamp(0.0, 100.0);
+    let color = if remaining <= 10.0 {
+        RED
+    } else if remaining <= 25.0 {
+        YELLOW
+    } else {
+        GREEN
+    };
+    (remaining, color)
+}
+
+fn format_credit_count(theme: &Theme, credits: &ResetCredits) -> String {
+    let (text, color) = credit_count_parts(credits);
+    theme.paint(text, color)
+}
+
+fn credit_count_parts(credits: &ResetCredits) -> (String, &'static str) {
+    match credits.available_count {
+        Some(0) => ("0 available".to_owned(), DIM),
+        Some(count) => (format!("{count} available"), GREEN),
+        None => ("unknown".to_owned(), YELLOW),
+    }
+}
+
+fn progress_bar(value: f64, width: usize) -> String {
+    let filled = ((value.clamp(0.0, 100.0) / 100.0) * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
+fn format_reset_time(time: DateTime<Utc>) -> String {
+    format!(
+        "{} ({})",
+        time.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
+        relative_time(time)
+    )
+}
+
+fn format_reset_summary(time: DateTime<Utc>) -> String {
+    format!(
+        "{} ({})",
+        time.with_timezone(&Local).format("%m-%d %H:%M"),
+        short_relative_time(time)
+    )
+}
+
+fn relative_time(time: DateTime<Utc>) -> String {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "now".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("in {days}d {hours}h")
+    } else if hours > 0 {
+        format!("in {hours}h {minutes}m")
+    } else {
+        format!("in {minutes}m")
+    }
+}
+
+fn short_relative_time(time: DateTime<Utc>) -> String {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "now".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else {
+        format!("{}h", hours.max(1))
+    }
+}
+
+fn expiry_color(time: DateTime<Utc>) -> &'static str {
+    let seconds = (time - Utc::now()).num_seconds();
+    if seconds <= 172_800 {
+        RED
+    } else if seconds <= 604_800 {
+        YELLOW
+    } else {
+        GREEN
+    }
+}
+
+fn limit_label(limit: &ai_monitor::codex::LimitWindow) -> String {
+    match limit.window_minutes {
+        Some(300) => "5 hour".to_owned(),
+        Some(10_080) => "Weekly".to_owned(),
+        Some(minutes) if minutes % 1_440 == 0 => format!("{} day", minutes / 1_440),
+        Some(minutes) if minutes % 60 == 0 => format!("{} hour", minutes / 60),
+        Some(minutes) => format!("{minutes} min"),
+        None => limit.name.clone(),
+    }
+}
+
+fn output_credits(format: OutputFormat, profile: &str, credits: &ResetCredits) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(format, credits);
+    }
+    println!(
+        "{profile}: {} reset credits ({})",
+        credits
+            .available_count
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        credits.source
+    );
+    for credit in credits.credits.as_deref().unwrap_or_default() {
+        println!(
+            "  {}  {}  {}",
+            credit.status.as_deref().unwrap_or("unknown"),
+            credit.title.as_deref().unwrap_or("Reset credit"),
+            credit
+                .expires_at
+                .map(|time| time
+                    .with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string())
+                .unwrap_or_else(|| "unknown".to_owned())
+        );
+    }
+    Ok(())
+}
+
+fn compact(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.2}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_owned();
+    }
+    value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_credit_lookup_is_enabled_by_default() {
+        let cli = Cli::try_parse_from(["ai-monitor", "codex", "all"]).unwrap();
+        let Commands::Codex {
+            command: CodexCommands::All { private_api },
+        } = cli.command
+        else {
+            panic!("expected codex all command");
+        };
+        assert!(private_api.enabled());
+    }
+
+    #[test]
+    fn private_credit_lookup_can_be_disabled() {
+        let cli = Cli::try_parse_from(["ai-monitor", "codex", "all", "--no-private-api"]).unwrap();
+        let Commands::Codex {
+            command: CodexCommands::All { private_api },
+        } = cli.command
+        else {
+            panic!("expected codex all command");
+        };
+        assert!(!private_api.enabled());
+    }
+
+    #[test]
+    fn remaining_usage_is_the_inverse_of_used_usage() {
+        assert_eq!(remaining_usage(28.0), (72.0, GREEN));
+        assert_eq!(remaining_usage(90.0), (10.0, RED));
+    }
+}
