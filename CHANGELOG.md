@@ -2,6 +2,25 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.5.0](https://github.com/AdemKao/ai-monitor/compare/v0.4.3...v0.5.0) - 2026-09-05
+
+### Added
+
+- *(codex)* improve dashboard usage hierarchy
+- *(codex)* show additional rate-limit buckets
+
+### Fixed
+
+- preserve app-server flush error mapping
+
+### Other
+
+- document automated release lifecycle
+- *(release)* add release-plz automation
+- *(release)* configure release-plz lifecycle
+- keep dashboard entrypoint diff focused
+- format Codex rate-limit normalization
+
 ## [0.4.3] - 2026-08-13
 
 - OpenCode terminal usage 與 overview 新增 today／yesterday／30-days range preset、成本／token摘要、provider 成本分布與每日 usage trend。
