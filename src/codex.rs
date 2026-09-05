@@ -398,7 +398,7 @@ impl AppServer {
     fn send(&mut self, value: &Value) -> Result<()> {
         serde_json::to_writer(&mut self.stdin, value).map_err(|_| Error::Protocol)?;
         self.stdin.write_all(b"\n").map_err(|_| Error::Closed)?;
-        self.stdin.flush().map_err(|_| Error::Closed)
+        self.stdin.flush().map_err(Error::Closed)
     }
 
     #[allow(dead_code)]
@@ -571,12 +571,7 @@ fn normalize_rate_limits(limits_result: &Value) -> Vec<LimitWindow> {
         });
         for (limit_id, bucket) in additional {
             let limit_name = string_field(bucket, &["limitName", "limit_name"]);
-            append_limit_windows(
-                &mut limits,
-                bucket,
-                Some(limit_id),
-                limit_name.as_deref(),
-            );
+            append_limit_windows(&mut limits, bucket, Some(limit_id), limit_name.as_deref());
         }
     }
     limits
@@ -596,11 +591,9 @@ fn append_limit_windows(
         if !window.is_object() {
             continue;
         }
-        let source_window_minutes = number_field(
-            window,
-            &["windowDurationMins", "window_duration_mins"],
-        )
-        .map(|value| value.max(0.0).round() as u64);
+        let source_window_minutes =
+            number_field(window, &["windowDurationMins", "window_duration_mins"])
+                .map(|value| value.max(0.0).round() as u64);
         let name = if let Some(limit_id) = limit_id {
             additional_window_label(
                 &additional_bucket_label_with_name(limit_id, limit_name),
