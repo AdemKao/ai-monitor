@@ -1,0 +1,21 @@
+[workspace]
+# ai-monitor is distributed through GitHub Releases rather than crates.io.
+# Use git tags as the release source of truth and let cargo-dist own the
+# GitHub Release/artifact publishing step.
+git_only = true
+git_release_enable = false
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+# Do not publish every feature merge. A tag is created only when the latest
+# main commit came from a release-plz PR.
+release_always = false
+pr_branch_prefix = "release-plz-"
+
+# For this 0.x CLI we intentionally use product-style versioning: feature
+# commits advance 0.x -> 0.(x+1).0 instead of only bumping the patch version.
+features_always_increment_minor = true
+
+[[package]]
+name = "ai-monitor"
+changelog_path = "CHANGELOG.md"
