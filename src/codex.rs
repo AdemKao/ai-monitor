@@ -459,6 +459,12 @@ pub struct LimitWindow {
     pub used_percent: f64,
     pub window_minutes: Option<u64>,
     pub resets_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_window_minutes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -517,32 +523,14 @@ fn normalize_snapshot(
         email: string_field(account_value, &["email"]),
         plan_type: string_field(account_value, &["planType", "plan_type"]),
     };
-    let limits_value = limits_result
+    let limits = normalize_rate_limits(limits_result);
+    let standard_limits = limits_result
         .pointer("/rateLimitsByLimitId/codex")
         .or_else(|| limits_result.get("rateLimits"))
         .unwrap_or(limits_result);
-    let mut limits = Vec::new();
-    for name in ["primary", "secondary"] {
-        if let Some(window) = limits_value.get(name) {
-            if !window.is_object() {
-                continue;
-            }
-            limits.push(LimitWindow {
-                name: name.to_owned(),
-                used_percent: number_field(window, &["usedPercent", "used_percent"])
-                    .unwrap_or_default(),
-                window_minutes: number_field(
-                    window,
-                    &["windowDurationMins", "window_duration_mins"],
-                )
-                .map(|value| value.max(0.0).round() as u64),
-                resets_at: field(window, &["resetsAt", "resets_at"]).and_then(parse_datetime),
-            });
-        }
-    }
     let credits_value = limits_result
         .get("rateLimitResetCredits")
-        .or_else(|| limits_value.get("rateLimitResetCredits"));
+        .or_else(|| standard_limits.get("rateLimitResetCredits"));
     let reset_credits = credits_value
         .map(|value| normalize_credits(value, "app-server"))
         .unwrap_or_else(|| ResetCredits {
@@ -557,6 +545,131 @@ fn normalize_snapshot(
         usage,
         usage_error,
     }
+}
+
+fn normalize_rate_limits(limits_result: &Value) -> Vec<LimitWindow> {
+    let by_limit_id = limits_result
+        .get("rateLimitsByLimitId")
+        .and_then(Value::as_object);
+    let standard = by_limit_id
+        .and_then(|buckets| buckets.get("codex"))
+        .or_else(|| limits_result.get("rateLimits"))
+        .unwrap_or(limits_result);
+
+    let mut limits = Vec::new();
+    append_limit_windows(&mut limits, standard, None, None);
+
+    if let Some(buckets) = by_limit_id {
+        let mut additional = buckets
+            .iter()
+            .filter(|(limit_id, _)| limit_id.as_str() != "codex")
+            .collect::<Vec<_>>();
+        additional.sort_by(|(left_id, left), (right_id, right)| {
+            additional_bucket_label(left_id, left)
+                .cmp(&additional_bucket_label(right_id, right))
+                .then_with(|| left_id.cmp(right_id))
+        });
+        for (limit_id, bucket) in additional {
+            let limit_name = string_field(bucket, &["limitName", "limit_name"]);
+            append_limit_windows(
+                &mut limits,
+                bucket,
+                Some(limit_id),
+                limit_name.as_deref(),
+            );
+        }
+    }
+    limits
+}
+
+fn append_limit_windows(
+    limits: &mut Vec<LimitWindow>,
+    bucket: &Value,
+    limit_id: Option<&str>,
+    limit_name: Option<&str>,
+) {
+    let additional = limit_id.is_some();
+    for slot in ["primary", "secondary"] {
+        let Some(window) = bucket.get(slot) else {
+            continue;
+        };
+        if !window.is_object() {
+            continue;
+        }
+        let source_window_minutes = number_field(
+            window,
+            &["windowDurationMins", "window_duration_mins"],
+        )
+        .map(|value| value.max(0.0).round() as u64);
+        let name = if let Some(limit_id) = limit_id {
+            additional_window_label(
+                &additional_bucket_label_with_name(limit_id, limit_name),
+                source_window_minutes,
+                slot,
+            )
+        } else {
+            slot.to_owned()
+        };
+        limits.push(LimitWindow {
+            name,
+            used_percent: number_field(window, &["usedPercent", "used_percent"])
+                .unwrap_or_default(),
+            window_minutes: if additional {
+                None
+            } else {
+                source_window_minutes
+            },
+            resets_at: field(window, &["resetsAt", "resets_at"]).and_then(parse_datetime),
+            limit_id: limit_id.map(str::to_owned),
+            limit_name: limit_name.map(str::to_owned),
+            source_window_minutes: additional.then_some(source_window_minutes).flatten(),
+        });
+    }
+}
+
+fn additional_bucket_label(limit_id: &str, bucket: &Value) -> String {
+    additional_bucket_label_with_name(
+        limit_id,
+        string_field(bucket, &["limitName", "limit_name"]).as_deref(),
+    )
+}
+
+fn additional_bucket_label_with_name(limit_id: &str, limit_name: Option<&str>) -> String {
+    let candidate = limit_name.unwrap_or(limit_id);
+    let candidate_lower = candidate.to_ascii_lowercase();
+    let id_lower = limit_id.to_ascii_lowercase();
+    if candidate_lower.contains("spark") || id_lower.contains("bengalfox") {
+        return "Spark".to_owned();
+    }
+    if candidate_lower.contains("reserve") || id_lower == "base_model_inference" {
+        return "Reserve".to_owned();
+    }
+
+    let cleaned = candidate
+        .chars()
+        .map(|character| {
+            if matches!(character, '_' | '-') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let compact = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact.chars().take(10).collect()
+}
+
+fn additional_window_label(base: &str, minutes: Option<u64>, slot: &str) -> String {
+    let suffix = match minutes {
+        Some(300) => "5h".to_owned(),
+        Some(10_080) => "W".to_owned(),
+        Some(minutes) if minutes % 1_440 == 0 => format!("{}d", minutes / 1_440),
+        Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+        Some(minutes) => format!("{minutes}m"),
+        None if slot == "primary" => "P".to_owned(),
+        None => "S".to_owned(),
+    };
+    format!("{base} {suffix}")
 }
 
 pub fn detailed_credits(
@@ -759,7 +872,58 @@ mod tests {
         );
         assert_eq!(snapshot.account.email.as_deref(), Some("me@example.test"));
         assert_eq!(snapshot.limits[0].used_percent, 20.0);
+        assert_eq!(snapshot.limits[0].name, "primary");
+        assert_eq!(snapshot.limits[0].window_minutes, Some(300));
         assert_eq!(snapshot.reset_credits.available_count, Some(2));
+    }
+
+    #[test]
+    fn normalizes_additional_rate_limit_buckets() {
+        let snapshot = normalize_snapshot(
+            "main",
+            &json!({"account":{"email":"me@example.test","planType":"plus"}}),
+            &json!({
+                "rateLimits": {
+                    "limitId":"codex",
+                    "primary":{"usedPercent":10,"windowDurationMins":300,"resetsAt":4102444800_u64},
+                    "secondary":{"usedPercent":35,"windowDurationMins":10080,"resetsAt":4103049600_u64}
+                },
+                "rateLimitsByLimitId": {
+                    "base_model_inference": {
+                        "limitId":"base_model_inference",
+                        "limitName":"gpt-reserve",
+                        "primary":{"usedPercent":8,"windowDurationMins":10080,"resetsAt":4103049600_u64}
+                    },
+                    "codex_bengalfox": {
+                        "limitId":"codex_bengalfox",
+                        "limitName":"GPT-5.3-Codex-Spark",
+                        "primary":{"usedPercent":4,"windowDurationMins":300,"resetsAt":4102444800_u64},
+                        "secondary":{"usedPercent":12,"windowDurationMins":10080,"resetsAt":4103049600_u64}
+                    }
+                }
+            }),
+            None,
+            None,
+        );
+
+        assert_eq!(snapshot.limits.len(), 5);
+        assert_eq!(snapshot.limits[0].name, "primary");
+        assert_eq!(snapshot.limits[1].name, "secondary");
+        let reserve = snapshot
+            .limits
+            .iter()
+            .find(|limit| limit.name == "Reserve W")
+            .unwrap();
+        assert_eq!(reserve.used_percent, 8.0);
+        assert_eq!(reserve.limit_id.as_deref(), Some("base_model_inference"));
+        assert_eq!(reserve.source_window_minutes, Some(10_080));
+        let spark_5h = snapshot
+            .limits
+            .iter()
+            .find(|limit| limit.name == "Spark 5h")
+            .unwrap();
+        assert_eq!(spark_5h.used_percent, 4.0);
+        assert_eq!(spark_5h.window_minutes, None);
     }
 
     #[test]
