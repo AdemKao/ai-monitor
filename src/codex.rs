@@ -398,7 +398,7 @@ impl AppServer {
     fn send(&mut self, value: &Value) -> Result<()> {
         serde_json::to_writer(&mut self.stdin, value).map_err(|_| Error::Protocol)?;
         self.stdin.write_all(b"\n").map_err(|_| Error::Closed)?;
-        self.stdin.flush().map_err(Error::Closed)
+        self.stdin.flush().map_err(|_| Error::Closed)
     }
 
     #[allow(dead_code)]
