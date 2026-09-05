@@ -9,6 +9,11 @@ readme = "README.md"
 keywords = ["ai", "codex", "opencode", "usage", "cli"]
 categories = ["command-line-utilities"]
 rust-version = "1.85"
+autobins = false
+
+[[bin]]
+name = "ai-monitor"
+path = "src/entry.rs"
 
 [dependencies]
 anyhow = "1.0"
