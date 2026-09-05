@@ -2,6 +2,17 @@
 
 `ai-monitor` 的重要變更記錄於此。
 
+## [0.5.1](https://github.com/AdemKao/ai-monitor/compare/v0.5.0...v0.5.1) - 2026-09-05
+
+### Fixed
+
+- *(release)* dispatch cargo-dist after release tag
+
+### Other
+
+- *(release)* explain dispatch bridge
+- *(release)* clarify manual tag input
+
 ## [0.5.0](https://github.com/AdemKao/ai-monitor/compare/v0.4.3...v0.5.0) - 2026-09-05
 
 ### Added
