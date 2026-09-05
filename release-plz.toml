@@ -3,6 +3,7 @@
 # Use git tags as the release source of truth and let cargo-dist own the
 # GitHub Release/artifact publishing step.
 git_only = true
+publish = false
 git_release_enable = false
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
@@ -18,4 +19,8 @@ features_always_increment_minor = true
 
 [[package]]
 name = "ai-monitor"
+# Keep this explicit as a defense-in-depth guard: this project must never run
+# `cargo publish`; cargo-dist is the only publisher and creates GitHub assets.
+git_only = true
+publish = false
 changelog_path = "CHANGELOG.md"
