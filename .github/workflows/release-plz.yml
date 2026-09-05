@@ -33,9 +33,52 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  dispatch-cargo-dist:
+    name: Dispatch cargo-dist release
+    needs: release-plz-release
+    if: ${{ github.repository == 'AdemKao/ai-monitor' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Dispatch release workflow for an unpublished version tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          TAG="v${VERSION}"
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} does not exist yet; nothing to publish."
+            exit 0
+          fi
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "GitHub Release ${TAG} already exists; nothing to dispatch."
+            exit 0
+          fi
+
+          echo "${TAG} exists but has no GitHub Release; dispatching cargo-dist."
+          gh workflow run release.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref main \
+            -f release_tag="${TAG}"
+
   release-plz-pr:
     name: Release-plz PR
-    needs: release-plz-release
+    needs:
+      - release-plz-release
+      - dispatch-cargo-dist
     if: ${{ github.repository == 'AdemKao/ai-monitor' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-22.04
     permissions:
