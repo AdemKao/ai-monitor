@@ -22,7 +22,7 @@ release-plz PR
 Release-plz `release`
     ↓
 vX.Y.Z tag
-    ↓
+    ↓ explicit workflow_dispatch bridge
 cargo-dist Release workflow
     ↓
 GitHub Release + platform artifacts
@@ -30,9 +30,17 @@ GitHub Release + platform artifacts
 `ai-monitor update`
 ```
 
-`release-plz.toml` uses `git_only = true`, so no crates.io token or package publication is required. `git_release_enable = false` keeps GitHub Release creation owned by cargo-dist instead of creating two competing releases.
+`release-plz.toml` uses `git_only = true` and `publish = false`, so no crates.io token or package publication is required. `git_release_enable = false` keeps GitHub Release creation owned by cargo-dist instead of creating two competing releases.
 
 `release_always = false` is important: only a merged release-plz PR creates a new tag. Ordinary merges merely create or update the pending release PR.
+
+## Why the dispatch bridge exists
+
+Release-plz creates tags using the repository `GITHUB_TOKEN`. GitHub intentionally prevents most events created by `GITHUB_TOKEN` from starting another workflow, so the resulting tag push does **not** reliably trigger the cargo-dist workflow's `push.tags` listener.
+
+The Release-plz workflow therefore checks whether the current `vX.Y.Z` tag exists without a matching GitHub Release and explicitly starts `.github/workflows/release.yml` with `workflow_dispatch`. `workflow_dispatch` is one of GitHub's supported exceptions to the recursion-prevention rule.
+
+The dispatch is idempotent: if the tag does not exist yet, or the GitHub Release already exists, it does nothing.
 
 ## GitHub repository setting required once
 
@@ -42,12 +50,12 @@ Release-plz uses `GITHUB_TOKEN` to create/update its release PR. In **Settings �
 
 While the project is `0.x`, feature commits intentionally advance the minor version (`0.4.x → 0.5.0`). Fix-only releases may remain patch releases when the generated release plan contains no feature-level change.
 
-For the current unreleased Codex multi-bucket and dashboard work, the first release PR after this automation lands is expected to prepare **v0.5.0** from the existing **v0.4.3** tag.
-
 ## Why a green `Release` workflow on a PR did not publish
 
-The existing cargo-dist workflow also runs a planning pass for pull requests. PR runs have publishing disabled, so their build/publish jobs are skipped by design. A real GitHub Release is created only after a `v*` tag exists (or a release workflow is manually dispatched for an existing release tag).
+The cargo-dist workflow also runs a planning pass for pull requests. PR runs have publishing disabled, so their build/publish jobs are skipped by design. A real GitHub Release is created only for an existing `v*` tag.
 
-## Recovery
+## Manual recovery
 
-If the Release-plz workflow fails to create a PR, first verify the repository setting above. If a `v*` tag exists but the GitHub Release is missing, inspect the cargo-dist `Release` workflow for that tag; do not create a second tag with a different commit just to retry artifact publishing.
+If a `v*` tag exists but the GitHub Release is missing, manually dispatch the **Release** workflow with the full tag, including the leading `v` (for example `v0.5.0`). Entering `0.5.0` will fail checkout because that ref does not exist.
+
+Do not create a second tag with a different commit just to retry artifact publishing.
