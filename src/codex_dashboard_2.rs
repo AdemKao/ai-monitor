@@ -6,6 +6,7 @@ fn output_codex_dashboard_v2(
     use_private_api: bool,
     queried_at: DateTime<Local>,
 ) -> Result<()> {
+    let subscriptions = collect_codex_subscription_info(results, use_private_api);
     if matches!(format, OutputFormat::Json) {
         return output_value(
             format,
@@ -14,6 +15,7 @@ fn output_codex_dashboard_v2(
                 "account_count": results.len(),
                 "selected_profile": selected,
                 "accounts": results,
+                "subscriptions": subscriptions,
             }),
         );
     }
@@ -47,6 +49,19 @@ fn output_codex_dashboard_v2(
         &format!(" Queried: {}", queried_at.format("%Y-%m-%d %H:%M:%S %:z")),
         width,
     );
+    let header_subscription = selected
+        .and_then(|profile| subscription_for_profile(&subscriptions, profile))
+        .or_else(|| (subscriptions.len() == 1).then(|| &subscriptions[0]));
+    let subscription_line = header_subscription.map(|subscription| {
+        truncate(
+            &format!(
+                " Plan: {} · renewal: {}",
+                subscription.plan_display,
+                format_subscription_renewal(subscription)
+            ),
+            width,
+        )
+    });
 
     println!();
     println!(
@@ -61,6 +76,12 @@ fn output_codex_dashboard_v2(
         "│{}│",
         pad_visible(&theme.paint(queried_line, DIM), width)
     );
+    if let Some(subscription_line) = subscription_line {
+        println!(
+            "│{}│",
+            pad_visible(&theme.paint(subscription_line, DIM), width)
+        );
+    }
     println!("╰{}╯", "─".repeat(width));
 
     println!();
@@ -84,7 +105,14 @@ fn output_codex_dashboard_v2(
         println!("  No Codex accounts found. Run `ai-monitor codex login NAME`.");
     }
     for result in results {
-        render_account_card_v2(&theme, result, selected, use_private_api, width);
+        render_account_card_v2(
+            &theme,
+            result,
+            selected,
+            use_private_api,
+            width,
+            subscription_for_profile(&subscriptions, &result.profile),
+        );
     }
 
     if !use_private_api && results.iter().any(missing_credit_details) {

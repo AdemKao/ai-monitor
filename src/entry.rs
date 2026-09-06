@@ -5,6 +5,7 @@ mod cli {
     include!("codex_dashboard_2.rs");
     include!("codex_dashboard_3.rs");
     include!("codex_dashboard_4.rs");
+    include!("codex_dashboard_5.rs");
 
     pub(super) fn entry() {
         if let Err(error) = run_with_codex_dashboard() {
