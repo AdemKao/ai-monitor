@@ -118,6 +118,17 @@ fn run_codex_with_codex_dashboard(
                 queried_at,
             )
         }
+        CodexCommands::Credits {
+            profile,
+            private_api,
+        } => {
+            let store =
+                ProfileStore::from_env().context("failed to open Codex profile storage")?;
+            let profile = store.resolve(profile.as_deref())?;
+            let snapshot = fetch(&profile)?;
+            let credits = detailed_credits(&profile, &snapshot, private_api.enabled())?;
+            output_credits_v2(format, color, &profile.name, &credits)
+        }
         CodexCommands::All { private_api } => {
             let store =
                 ProfileStore::from_env().context("failed to open Codex profile storage")?;
