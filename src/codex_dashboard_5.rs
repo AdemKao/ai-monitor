@@ -121,7 +121,7 @@ fn format_codex_plan_name(plan_type: Option<&str>) -> String {
         "enterprise" => "Enterprise".to_owned(),
         "edu" => "Edu".to_owned(),
         other => other
-            .split(|character: char| matches!(character, '-' | '_'))
+            .split(['-', '_'])
             .filter(|part| !part.is_empty())
             .map(|part| {
                 let mut chars = part.chars();
