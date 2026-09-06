@@ -30,11 +30,9 @@ fn render_credit_summary_v2(
 
     match credits.credits.as_deref() {
         Some(rows) if !rows.is_empty() => {
-            let hint = truncate(
-                &format!("   Details: ai-monitor codex credits --profile {profile}"),
-                width,
-            );
-            card_line(theme, width, &theme.paint(hint, DIM));
+            for (index, credit) in rows.iter().enumerate() {
+                render_credit_detail_v2(theme, index + 1, credit, width);
+            }
         }
         Some(_) if credits.available_count.unwrap_or(0) > 0 => {
             card_line(
@@ -60,7 +58,109 @@ fn render_credit_summary_v2(
                 width,
                 &theme.paint(truncate(&format!("   {hint}"), width), YELLOW),
             );
+            let command = truncate(
+                &format!("   Details: ai-monitor codex credits --profile {profile}"),
+                width,
+            );
+            card_line(theme, width, &theme.paint(command, DIM));
         }
+    }
+}
+
+fn render_credit_detail_v2(theme: &Theme, index: usize, credit: &ResetCredit, width: usize) {
+    let status = credit.status.as_deref().unwrap_or("unknown");
+    let normalized = status.to_ascii_lowercase();
+    let (badge, color) = if matches!(normalized.as_str(), "available" | "active") {
+        ("AVAILABLE", GREEN)
+    } else if normalized.contains("expired") {
+        ("EXPIRED", RED)
+    } else if normalized.contains("used") || normalized.contains("consumed") {
+        ("USED", DIM)
+    } else if normalized.contains("pending") {
+        ("PENDING", YELLOW)
+    } else {
+        ("UNKNOWN", YELLOW)
+    };
+    let remaining = credit_remaining_text(credit.expires_at);
+    let id = credit
+        .id
+        .as_deref()
+        .map(|value| truncate(value, 12))
+        .unwrap_or_else(|| format!("#{index:03}"));
+    let heading = format!("   #{index:03} [{badge}] status={status} · id={id}");
+    card_line(theme, width, &theme.paint(truncate(&heading, width), color));
+    card_line(
+        theme,
+        width,
+        &theme.paint(truncate(&format!("        {remaining}"), width), color),
+    );
+
+    let granted = credit.granted_at.map(format_credit_time_v2);
+    let expires = credit.expires_at.map(format_credit_time_v2);
+    if width >= 86 {
+        let lifecycle = format!(
+            "        granted {} · expires {}",
+            granted.as_deref().unwrap_or("N/A"),
+            expires.as_deref().unwrap_or("N/A")
+        );
+        card_line(theme, width, &theme.paint(truncate(&lifecycle, width), DIM));
+    } else {
+        card_line(
+            theme,
+            width,
+            &theme.paint(
+                truncate(
+                    &format!("        granted {}", granted.as_deref().unwrap_or("N/A")),
+                    width,
+                ),
+                DIM,
+            ),
+        );
+        card_line(
+            theme,
+            width,
+            &theme.paint(
+                truncate(
+                    &format!("        expires {}", expires.as_deref().unwrap_or("N/A")),
+                    width,
+                ),
+                DIM,
+            ),
+        );
+    }
+
+    if let Some(title) = credit.title.as_deref().filter(|title| !title.is_empty()) {
+        card_line(
+            theme,
+            width,
+            &theme.paint(truncate(&format!("        {title}"), width), DIM),
+        );
+    }
+}
+
+fn format_credit_time_v2(time: DateTime<Utc>) -> String {
+    time.with_timezone(&Local)
+        .format("%Y-%m-%d %H:%M %:z")
+        .to_string()
+}
+
+fn credit_remaining_text(expires_at: Option<DateTime<Utc>>) -> String {
+    let Some(expires_at) = expires_at else {
+        return "remaining N/A".to_owned();
+    };
+    let seconds = (expires_at - Utc::now()).num_seconds();
+    if seconds <= 0 {
+        return "expired".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if days > 0 {
+        format!("remaining {days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("remaining {hours}h {minutes}m")
+    } else {
+        format!("remaining {minutes}m")
     }
 }
 
