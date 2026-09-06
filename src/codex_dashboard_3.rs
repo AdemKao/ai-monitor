@@ -40,6 +40,7 @@ fn render_account_card_v2(
     selected: Option<&str>,
     use_private_api: bool,
     width: usize,
+    subscription: Option<&CodexSubscriptionInfo>,
 ) {
     let selected_marker = if selected == Some(result.profile.as_str()) {
         " <selected>"
@@ -75,16 +76,30 @@ fn render_account_card_v2(
         return;
     };
 
+    let plan = subscription
+        .map(|subscription| subscription.plan_display.clone())
+        .unwrap_or_else(|| format_codex_plan_name(snapshot.account.plan_type.as_deref()));
     let account = format!(
         "{} · {}",
         snapshot.account.email.as_deref().unwrap_or("unknown"),
-        snapshot.account.plan_type.as_deref().unwrap_or("unknown")
+        plan
     );
     card_line(
         theme,
         width,
         &format!(" Account: {}", truncate(&account, width.saturating_sub(10))),
     );
+    if let Some(subscription) = subscription {
+        let renewal = format_subscription_renewal(subscription);
+        let line = format!(" Subscription renewal: {renewal}");
+        card_line(theme, width, &theme.paint(truncate(&line, width), DIM));
+        if subscription.renews_at.is_none() {
+            if let Some(error) = subscription.error.as_deref() {
+                let line = format!(" Subscription lookup: {error}");
+                card_line(theme, width, &theme.paint(truncate(&line, width), DIM));
+            }
+        }
+    }
     card_line(theme, width, "");
     card_line(theme, width, &theme.paint(" USAGE LIMITS", BOLD));
     if snapshot.limits.is_empty() {
