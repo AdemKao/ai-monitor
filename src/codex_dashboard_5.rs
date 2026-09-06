@@ -121,7 +121,7 @@ fn format_codex_plan_name(plan_type: Option<&str>) -> String {
         "enterprise" => "Enterprise".to_owned(),
         "edu" => "Edu".to_owned(),
         other => other
-            .split(['-', '_'])
+            .split(|character: char| matches!(character, '-' | '_'))
             .filter(|part| !part.is_empty())
             .map(|part| {
                 let mut chars = part.chars();
@@ -203,6 +203,62 @@ fn format_subscription_renewal(subscription: &CodexSubscriptionInfo) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| "N/A".to_owned())
+}
+
+fn output_credits_v2(
+    format: OutputFormat,
+    color: ColorMode,
+    profile: &str,
+    credits: &ResetCredits,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        return output_value(format, credits);
+    }
+
+    let theme = Theme::new(color);
+    let width = codex_ui_width();
+    println!();
+    println!("  ┌{}┐", "─".repeat(width));
+    card_line(
+        &theme,
+        width,
+        &theme.paint(truncate(&format!(" {profile} · RESET CREDITS"), width), BOLD),
+    );
+    card_line(&theme, width, "");
+    let (count, count_color) = credit_count_parts(credits);
+    let summary = format!("   {count} · source {}", credits.source);
+    card_line(
+        &theme,
+        width,
+        &theme.paint(truncate(&summary, width), count_color),
+    );
+
+    match credits.credits.as_deref() {
+        Some(rows) if !rows.is_empty() => {
+            for (index, credit) in rows.iter().enumerate() {
+                render_credit_detail_v2(&theme, index + 1, credit, width);
+            }
+        }
+        Some(_) if credits.available_count.unwrap_or(0) > 0 => card_line(
+            &theme,
+            width,
+            &theme.paint(
+                truncate("   Credit lifecycle details are unavailable.", width),
+                YELLOW,
+            ),
+        ),
+        Some(_) => card_line(&theme, width, "   No reset credits currently available."),
+        None => card_line(
+            &theme,
+            width,
+            &theme.paint(
+                truncate("   Reset-credit detail rows are unavailable.", width),
+                YELLOW,
+            ),
+        ),
+    }
+    println!("  └{}┘", "─".repeat(width));
+    Ok(())
 }
 
 #[cfg(test)]
